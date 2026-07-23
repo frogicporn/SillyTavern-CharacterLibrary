@@ -1934,23 +1934,15 @@ function registerSaucepanRoutes(router) {
         }
 
         try {
-            // The v2 companion supplies greetings and the Companion Core fallback.
+            // The v2 companion supplies greetings and the body fallback.
             const compRes = await fetchSaucepanJson(`/api/v2/companions/${encodeURIComponent(companionId)}`, token, companionId);
             const defRes = await fetchSaucepanJson(`/api/v1/companion/definition?companion_id=${encodeURIComponent(companionId)}`, token, companionId);
 
-            // The definition endpoint is authoritative; surface its auth errors.
-            if (!defRes.ok) {
-                const msg = defRes.data?.error?.message || `Saucepan HTTP ${defRes.status}`;
-                return res.status(defRes.status).json({ error: msg });
-            }
-            if (!defRes.data) {
-                return res.status(502).json({ error: 'Invalid JSON from Saucepan' });
-            }
-
             // Reassemble each definition section's shuffled fragments back into
             // prose, dropping the decoy fragments Saucepan injects (see
-            // assembleSaucepanFragments).
-            const sections = Array.isArray(defRes.data.sections) ? defRes.data.sections : [];
+            // assembleSaucepanFragments). The definition endpoint is 403-gated on
+            // locked cards, so it may be unavailable here.
+            const sections = defRes.ok && Array.isArray(defRes.data?.sections) ? defRes.data.sections : [];
             const assembled = {};
             for (const section of sections) {
                 const title = section?.title;
@@ -1961,7 +1953,26 @@ function registerSaucepanRoutes(router) {
 
             const companion = compRes.data?.companion || null;
             if (!compRes.ok || !companion) {
-                console.warn(`[cl-helper] Saucepan extract: greetings unavailable (companions/${companionId} HTTP ${compRes.status})`);
+                console.warn(`[cl-helper] Saucepan extract: companion unavailable (companions/${companionId} HTTP ${compRes.status})`);
+            }
+
+            // ── LOCAL BUILD ONLY (branch local/saucepan-locked-extraction) ──
+            // The v2 companion object carries full_description_fragments even for
+            // locked cards (open_definition === false), where the definition
+            // endpoint 403s. Reassembling it here recovers the body Saucepan's
+            // own lock withholds. Do NOT ship this: it defeats the creator's
+            // lock and Saucepan's anti-scrape obfuscation.
+            if (!assembled['Companion Core'] && companion?.full_description_fragments) {
+                assembled['Companion Core'] = assembleSaucepanFragments(companion.full_description_fragments);
+            }
+
+            // Only fail if neither source yielded a usable body.
+            if (!assembled['Companion Core']) {
+                if (!defRes.ok) {
+                    const msg = defRes.data?.error?.message || `Saucepan HTTP ${defRes.status}`;
+                    return res.status(defRes.status).json({ error: msg });
+                }
+                return res.status(502).json({ error: 'No definition body found' });
             }
 
             // Greetings live only on the v2 companion object as starting
@@ -1975,11 +1986,6 @@ function registerSaucepanRoutes(router) {
                 if (text && text.trim()) {
                     greetings.push({ title: typeof scenario?.title === 'string' ? scenario.title : '', text });
                 }
-            }
-
-            // Fall back to the v2 body if the definition lacked Companion Core.
-            if (!assembled['Companion Core'] && companion?.full_description_fragments) {
-                assembled['Companion Core'] = assembleSaucepanFragments(companion.full_description_fragments);
             }
 
             res.json({ success: true, companionId, assembled, greetings });
