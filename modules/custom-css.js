@@ -328,7 +328,6 @@ function buildModalHTML() {
                             <div class="mobile-sheet-handle"></div>
                             <div class="ccss-sidebar-header">
                                 <span class="ccss-drawer-title">Snippets</span>
-                                <button class="ccss-drawer-close" id="ccssDrawerCloseBtn" title="Close" aria-label="Close snippets drawer"><i class="fa-solid fa-xmark"></i></button>
                                 <button class="cl-btn cl-btn-primary ccss-sidebar-new" id="ccssNewBtn"><i class="fa-solid fa-plus"></i> New</button>
                             </div>
                             <div class="ccss-snippet-list" id="ccssSnippetList"></div>
@@ -814,7 +813,6 @@ function injectModal() {
     });
 
     document.getElementById('ccssDrawerTrigger')?.addEventListener('click', openDrawer);
-    document.getElementById('ccssDrawerCloseBtn')?.addEventListener('click', () => closeDrawer());
     document.getElementById('ccssDrawerScrim')?.addEventListener('click', () => closeDrawer());
 
     // Flipping back to desktop while the drawer is open at body level needs a force-restore.

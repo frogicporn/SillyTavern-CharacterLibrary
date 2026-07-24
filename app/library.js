@@ -538,7 +538,6 @@ const DEFAULT_SETTINGS = {
     datacatToken: null,
     datacatPublicFeed: false,
     datacatReextractOnUpdate: false,
-    datacatFlareSolverrUrl: '',
     saucepanToken: null,
     janitoraiToken: null,
     janitoraiRefreshToken: null,
@@ -2629,83 +2628,6 @@ function setupSettingsModal() {
             });
         }
 
-        // FlareSolverr endpoint for Hampter sort orders
-        const datacatFlareSolverrInput = document.getElementById('settingsDatacatFlareSolverrUrl');
-        const datacatFlareSolverrStatus = document.getElementById('datacatFlareSolverrStatus');
-        const testDatacatFlareSolverrBtn = document.getElementById('testDatacatFlareSolverrBtn');
-
-        const updateFlareSolverrStatusBadge = () => {
-            if (!datacatFlareSolverrStatus) return;
-            const url = (getSetting('datacatFlareSolverrUrl') || '').trim();
-            if (!url) {
-                datacatFlareSolverrStatus.className = 'settings-status-badge inactive';
-                datacatFlareSolverrStatus.innerHTML = '<i class="fa-solid fa-circle"></i> Not configured';
-            } else {
-                datacatFlareSolverrStatus.className = 'settings-status-badge active';
-                datacatFlareSolverrStatus.innerHTML = '<i class="fa-solid fa-circle"></i> Configured (untested)';
-            }
-        };
-
-        if (datacatFlareSolverrInput) {
-            datacatFlareSolverrInput.value = getSetting('datacatFlareSolverrUrl') || '';
-            datacatFlareSolverrInput.addEventListener('change', () => {
-                setSetting('datacatFlareSolverrUrl', datacatFlareSolverrInput.value.trim());
-                updateFlareSolverrStatusBadge();
-            });
-            datacatFlareSolverrInput.addEventListener('blur', () => {
-                setSetting('datacatFlareSolverrUrl', datacatFlareSolverrInput.value.trim());
-                updateFlareSolverrStatusBadge();
-            });
-        }
-        updateFlareSolverrStatusBadge();
-
-        if (testDatacatFlareSolverrBtn) {
-            testDatacatFlareSolverrBtn.addEventListener('click', async () => {
-                const url = (datacatFlareSolverrInput?.value || '').trim();
-                if (!url) {
-                    showToast('Enter a FlareSolverr URL first', 'warning');
-                    return;
-                }
-                setSetting('datacatFlareSolverrUrl', url);
-                if (datacatFlareSolverrStatus) {
-                    datacatFlareSolverrStatus.className = 'settings-status-badge inactive';
-                    datacatFlareSolverrStatus.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Testing...';
-                }
-                testDatacatFlareSolverrBtn.disabled = true;
-                try {
-                    const resp = await apiRequest(`/plugins/cl-helper/flaresolverr-fetch`, 'POST', {
-                        flareUrl: url,
-                        targetUrl: 'https://janitorai.com/hampter/characters?sort=trending&page=1',
-                    });
-                    const payload = await resp.json().catch(() => null);
-                    if (!resp.ok || !payload) {
-                        const msg = payload?.error || `HTTP ${resp.status}`;
-                        throw new Error(msg);
-                    }
-                    if (payload.status !== 'ok') {
-                        throw new Error(payload.message || 'FlareSolverr did not return ok');
-                    }
-                    const upstreamStatus = payload.solution?.status;
-                    if (typeof upstreamStatus === 'number' && upstreamStatus >= 400) {
-                        throw new Error(`Upstream HTTP ${upstreamStatus} (challenge not bypassed)`);
-                    }
-                    if (datacatFlareSolverrStatus) {
-                        datacatFlareSolverrStatus.className = 'settings-status-badge active';
-                        datacatFlareSolverrStatus.innerHTML = '<i class="fa-solid fa-circle-check"></i> Connected';
-                    }
-                    showToast('FlareSolverr connection successful', 'success');
-                } catch (err) {
-                    if (datacatFlareSolverrStatus) {
-                        datacatFlareSolverrStatus.className = 'settings-status-badge inactive';
-                        datacatFlareSolverrStatus.innerHTML = `<i class="fa-solid fa-circle-xmark"></i> Failed`;
-                    }
-                    showToast(`FlareSolverr test failed: ${err.message}`, 'error');
-                } finally {
-                    testDatacatFlareSolverrBtn.disabled = false;
-                }
-            });
-        }
-
         // Check cl-helper plugin availability for provider + cl-helper-backed feature sections
         const gridThumbsClHelperBanner = document.getElementById('gridThumbsClHelperBanner');
         const settingsGridThumbClHelperFields = document.getElementById('settingsGridThumbClHelperFields');
@@ -3801,6 +3723,16 @@ function setupSettingsModal() {
             }
         });
     }
+
+    document.getElementById('datacatRestoreAvatarsBtn')?.addEventListener('click', () => {
+        // Closes settings first: the restore modal opens its own review surface on top.
+        if (!window.datacatRestoreAvatars) {
+            showToast('DataCat module not ready', 'error');
+            return;
+        }
+        document.getElementById('gallerySettingsModal')?.classList.remove('visible');
+        window.datacatRestoreAvatars();
+    });
 
     const validateDatacatBtn = document.getElementById('validateDatacatBtn');
     if (validateDatacatBtn) {
@@ -20939,11 +20871,28 @@ function clearHighlights(container) {
 // Help & Tips Modal
 // ==============================================
 
-function openGalleryInfoModal() {
-    document.getElementById('galleryInfoModal').classList.add('visible');
+function openGalleryInfoModal(section, anchorId) {
+    const modal = document.getElementById('galleryInfoModal');
+    modal.classList.add('visible');
+    if (section) {
+        modal.querySelectorAll('.help-nav-item').forEach(n => n.classList.toggle('active', n.dataset.section === section));
+        modal.querySelectorAll('.help-panel').forEach(p => p.classList.toggle('active', p.dataset.section === section));
+    }
+    if (anchorId) {
+        requestAnimationFrame(() => document.getElementById(anchorId)?.scrollIntoView({ block: 'start' }));
+    }
 }
+// Exposed for the datacat browse view's Cloudflare-blocked notice to deep-link into the help section.
+window.openGalleryInfoModal = openGalleryInfoModal;
 
-document.getElementById('galleryInfoBtn')?.addEventListener('click', openGalleryInfoModal);
+document.getElementById('galleryInfoBtn')?.addEventListener('click', () => openGalleryInfoModal());
+
+// Deep-link from the DataCat/JanitorAI settings hint into the matching help section
+document.getElementById('hampterHelpLink')?.addEventListener('click', (e) => {
+    e.preventDefault();
+    document.getElementById('gallerySettingsModal')?.classList.remove('visible');
+    openGalleryInfoModal('providers', 'helpDatacatHampter');
+});
 
 function closeGalleryInfoModal() {
     const modal = document.getElementById('galleryInfoModal');
@@ -27969,6 +27918,8 @@ window.renderEmptyState = renderEmptyState;
 window.updateMobileFilterIndicator = updateMobileFilterIndicator;
 window.getActiveFilterState = getActiveFilterState;
 window.getCharacterAvatarStThumbUrl = getCharacterAvatarStThumbUrl;
+window.getCharacterAvatarUrl = getCharacterAvatarUrl;
+window.notifySTCharacterEdited = notifySTCharacterEdited;
 window.getListingNameFromExtensions = getListingNameFromExtensions;
 window.bumpAvatarCacheBust = bumpAvatarCacheBust;
 window.getDisplayTagline = getDisplayTagline;

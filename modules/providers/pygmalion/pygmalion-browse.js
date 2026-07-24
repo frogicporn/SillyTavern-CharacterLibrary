@@ -279,6 +279,8 @@ async function loadCharacters(append = false) {
     }
 
     try {
+        await ensureFreshPygToken();
+
         let data;
 
         const mergedExclude = [...pygExcludeTags];
@@ -861,6 +863,7 @@ async function fetchAndPopulateDetails(hit, stalenessToken) {
     if (!hit.id) return;
 
     try {
+        await ensureFreshPygToken();
         const data = await fetchCharacterDetail(hit.id, undefined, pygToken || undefined);
         if (stalenessToken !== pygDetailFetchToken) return;
         if (!data?.character) return;
@@ -1222,6 +1225,7 @@ async function switchPygViewMode(mode) {
 // ========================================
 
 async function loadPygFollowingTimeline(forceRefresh = false) {
+    await ensureFreshPygToken();
     if (!pygToken) {
         renderPygFollowingEmpty('login');
         return;
@@ -1743,11 +1747,38 @@ async function attemptTokenRecovery() {
     return false;
 }
 
+// Pyg id_tokens live 60 minutes, so the persisted token is usually stale by the next session,
+// and the server rejects stale auth with a 500 (not 401), invisible to the authFailed recovery.
+// Refresh before sending instead of burning a doomed request; without stored credentials the
+// stale token is unusable, so stop sending it (same UX the reactive recovery-failure path has).
+async function ensureFreshPygToken() {
+    if (!pygToken || getTokenTTL(pygToken) > 60) return;
+    await tryAutoLogin();
+    if (pygToken && getTokenTTL(pygToken) > 60) return;
+    pygToken = null;
+    if (pygNsfwEnabled) {
+        pygNsfwEnabled = false;
+        updateNsfwToggle();
+        showToast('Pygmalion token expired, please re-authenticate.', 'warning', 5000);
+        openPygTokenModal();
+    }
+}
+
+// The init-time load's freshness gate and activate's own call can overlap; share one login request
+let pygAutoLoginInFlight = null;
+
+function tryAutoLogin() {
+    if (!pygAutoLoginInFlight) {
+        pygAutoLoginInFlight = doAutoLogin().finally(() => { pygAutoLoginInFlight = null; });
+    }
+    return pygAutoLoginInFlight;
+}
+
 /**
  * Auto-login with stored credentials if plugin available and no valid token.
  * Called on activate() - runs silently, no toasts on failure.
  */
-async function tryAutoLogin() {
+async function doAutoLogin() {
     if (pygToken && getTokenTTL(pygToken) > 60) return;
     if (!getSetting('pygmalionRememberCredentials')) return;
 
@@ -1797,6 +1828,7 @@ let pygIsFollowingCurrentAuthor = false;
 let pygFollowedUserIds = null; // Set<string> - cached followed user IDs
 
 async function fetchPygFollowedUserIds() {
+    await ensureFreshPygToken();
     if (!pygToken) return new Set();
 
     try {
@@ -1880,6 +1912,7 @@ async function togglePygFollowAuthor() {
     try {
         let result;
         try {
+            await ensureFreshPygToken();
             result = await toggleFollowUser(pygToken, pygAuthorOwnerId);
         } catch (e) {
             if (e.authFailed) {
@@ -2348,6 +2381,7 @@ class PygmalionBrowseView extends BrowseView {
         }
 
         try {
+            await ensureFreshPygToken();
             const result = await toggleFollowUser(pygToken, trimmed);
             if (result.isFollowing) {
                 if (pygFollowedUserIds) pygFollowedUserIds.add(trimmed);
@@ -2368,6 +2402,7 @@ class PygmalionBrowseView extends BrowseView {
     async unfollowCreator(id) {
         if (!pygToken) return false;
         try {
+            await ensureFreshPygToken();
             const result = await toggleFollowUser(pygToken, id);
             if (!result.isFollowing) {
                 if (pygFollowedUserIds) pygFollowedUserIds.delete(id);

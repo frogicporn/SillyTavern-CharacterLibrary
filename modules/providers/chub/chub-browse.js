@@ -64,8 +64,10 @@ let chubToken = null; // URQL_TOKEN from chub.ai localStorage for Authorization 
 
 // Discovery preset definitions (sort + time combinations)
 const CHUB_DISCOVERY_PRESETS = {
+    'trending':      { sort: 'trending', days: 0 }, // Chub's own trending signal (distinct from raw download_count)
     'popular_week':  { sort: 'download_count', days: 7 },
     'popular_month': { sort: 'download_count', days: 30 },
+    'popular_year':  { sort: 'download_count', days: 365 }, // Most downloaded within the last year
     'popular_all':   { sort: 'download_count', days: 0 },
     'rated_week':    { sort: 'star_count', days: 7 },
     'rated_all':     { sort: 'star_count', days: 0 },
@@ -78,17 +80,23 @@ const CHUB_DISCOVERY_PRESETS = {
 // Additional ChubAI filters
 let chubFilterImages = false;
 let chubFilterLore = false;
-let chubFilterExpressions = false;
 let chubFilterGreetings = false;
+let chubFilterCustomPrompt = false;
+let chubFilterExampleDialogues = false;
+let chubExcludeForks = false;
 let chubFilterFavorites = false;
 let chubFilterHideOwned = false;
 let chubFilterHidePossible = false;
+// Server-param-only toggles: timeline/favorites nodes carry no matching field to client-filter
+const CHUB_BROWSE_ONLY_FILTER_IDS = ['chubFilterCustomPrompt', 'chubFilterExampleDialogues', 'chubExcludeForks'];
 
 // Advanced ChubAI filters (Tags dropdown)
 let chubTagFilters = new Map(); // Map<tagName, 'include' | 'exclude'>
 let chubSortAscending = false; // false = descending (default), true = ascending
 let chubMinTokens = 50; // Minimum tokens (API default)
 let chubMaxTokens = 100000; // Maximum tokens
+let chubMinAiRating = 0; // Minimum AI quality score 0-100 (chub's AI judge, not user stars; 0 = off)
+let chubAiRatingSortWarned = false; // once-per-session toast for the trending/newcomer incompatibility
 
 // ChubAI View mode and author filter
 let chubViewMode = 'browse'; // 'browse' or 'timeline'
@@ -317,8 +325,10 @@ class ChubBrowseView extends BrowseView {
     getSettingsConfig() {
         return {
             browseSortOptions: [
+                { value: 'trending', label: 'Trending' },
                 { value: 'popular_week', label: 'Hot This Week' },
                 { value: 'popular_month', label: 'Hot This Month' },
+                { value: 'popular_year', label: 'Popular This Year' },
                 { value: 'popular_all', label: 'Most Downloaded' },
                 { value: 'rated_week', label: 'Top Rated (Week)' },
                 { value: 'rated_all', label: 'Top Rated (All Time)' },
@@ -391,8 +401,10 @@ class ChubBrowseView extends BrowseView {
                 <!-- Discovery Preset (Browse mode) -->
                 <select id="chubDiscoveryPreset" class="glass-select" title="Discovery mode">
                     <optgroup label="Popular">
+                        <option value="trending">🚀 Trending</option>
                         <option value="popular_week" selected>🔥 Hot This Week</option>
                         <option value="popular_month">📈 Hot This Month</option>
+                        <option value="popular_year">📅 Popular This Year</option>
                         <option value="popular_all">👑 Most Downloaded</option>
                     </optgroup>
                     <optgroup label="Quality">
@@ -453,6 +465,10 @@ class ChubBrowseView extends BrowseView {
                         <label><i class="fa-solid fa-text-width"></i> Max Tokens</label>
                         <input type="number" id="chubMaxTokens" class="glass-input-small" value="100000" min="0" max="500000" step="1000">
                     </div>
+                    <div class="browse-advanced-option" title="ChubAI's automated quality score from 0 to 100, not the user star rating. 0 disables the filter. ChubAI scores cards roughly two weeks after upload, so newer cards are always excluded while this is set, and the Trending, Hot This Week, Top Rated (Week), and Recent Hits sorts don't support it at all.">
+                        <label><i class="fa-solid fa-ranking-star"></i> Min AI Score</label>
+                        <input type="number" id="chubMinAiRating" class="glass-input-small" value="0" min="0" max="100" step="5">
+                    </div>
                     </div>
                 </div>
             </div>
@@ -466,8 +482,11 @@ class ChubBrowseView extends BrowseView {
                     <div class="dropdown-section-title">Character must have:</div>
                     <label class="filter-checkbox"><input type="checkbox" id="chubFilterImages"> <i class="fa-solid fa-images"></i> Image Gallery</label>
                     <label class="filter-checkbox"><input type="checkbox" id="chubFilterLore"> <i class="fa-solid fa-book"></i> Lorebook</label>
-                    <label class="filter-checkbox"><input type="checkbox" id="chubFilterExpressions"> <i class="fa-solid fa-face-smile"></i> Expressions</label>
                     <label class="filter-checkbox"><input type="checkbox" id="chubFilterGreetings"> <i class="fa-solid fa-comments"></i> Alt Greetings</label>
+                    <label class="filter-checkbox"><input type="checkbox" id="chubFilterCustomPrompt"> <i class="fa-solid fa-terminal"></i> Custom System Prompt</label>
+                    <label class="filter-checkbox"><input type="checkbox" id="chubFilterExampleDialogues"> <i class="fa-solid fa-comment-dots"></i> Example Dialogues</label>
+                    <hr style="margin: 8px 0; border-color: var(--glass-border);">
+                    <label class="filter-checkbox"><input type="checkbox" id="chubExcludeForks"> <i class="fa-solid fa-code-branch"></i> Exclude Forks</label>
                     <hr style="margin: 8px 0; border-color: var(--glass-border);">
                     <div class="dropdown-section-title">Personal <span style="font-size: 0.8em; opacity: 0.6;">(requires login)</span>:</div>
                     <label class="filter-checkbox"><input type="checkbox" id="chubFilterFavorites"> <i class="fa-solid fa-heart" style="color: #e74c3c;"></i> My Favorites</label>
@@ -814,6 +833,7 @@ class ChubBrowseView extends BrowseView {
             if (tsTarget) tsTarget.classList.remove('browse-filter-hidden');
             const tagsContainer = document.querySelector('.browse-tags-dropdown-container');
             if (tagsContainer) tagsContainer.classList.add('browse-filter-hidden');
+            updateChubFeatureFilterAvailability();
         }
         if (defaults.sort) {
             if (chubViewMode === 'browse') {
@@ -1075,8 +1095,10 @@ function initChubView() {
     const filterCheckboxes = [
         { id: 'chubFilterImages', setter: (v) => chubFilterImages = v, getter: () => chubFilterImages },
         { id: 'chubFilterLore', setter: (v) => chubFilterLore = v, getter: () => chubFilterLore },
-        { id: 'chubFilterExpressions', setter: (v) => chubFilterExpressions = v, getter: () => chubFilterExpressions },
         { id: 'chubFilterGreetings', setter: (v) => chubFilterGreetings = v, getter: () => chubFilterGreetings },
+        { id: 'chubFilterCustomPrompt', setter: (v) => chubFilterCustomPrompt = v, getter: () => chubFilterCustomPrompt },
+        { id: 'chubFilterExampleDialogues', setter: (v) => chubFilterExampleDialogues = v, getter: () => chubFilterExampleDialogues },
+        { id: 'chubExcludeForks', setter: (v) => chubExcludeForks = v, getter: () => chubExcludeForks },
         { id: 'chubFilterFavorites', setter: (v) => chubFilterFavorites = v, getter: () => chubFilterFavorites },
         { id: 'chubFilterHideOwned', setter: (v) => chubFilterHideOwned = v, getter: () => chubFilterHideOwned },
         { id: 'chubFilterHidePossible', setter: (v) => chubFilterHidePossible = v, getter: () => chubFilterHidePossible }
@@ -1087,7 +1109,7 @@ function initChubView() {
         const checkbox = document.getElementById(id);
         if (checkbox) checkbox.checked = getter();
     });
-    updateChubFiltersButtonState();
+    updateChubFeatureFilterAvailability();
     
     filterCheckboxes.forEach(({ id, setter }) => {
         document.getElementById(id)?.addEventListener('change', async (e) => {
@@ -1525,20 +1547,35 @@ function updateChubFiltersButtonState() {
     const btn = document.getElementById('chubFiltersBtn');
     if (!btn) return;
     
-    const hasActiveFilters = chubFilterImages || chubFilterLore || 
-                             chubFilterExpressions || chubFilterGreetings || 
-                             chubFilterFavorites || chubFilterHideOwned || chubFilterHidePossible;
-    
-    btn.classList.toggle('has-filters', hasActiveFilters);
-    
-    const count = [chubFilterImages, chubFilterLore, chubFilterExpressions, 
-                   chubFilterGreetings, chubFilterFavorites, chubFilterHideOwned, chubFilterHidePossible].filter(Boolean).length;
-    
+    // Browse-only toggles don't count in the Following tab, where they can't filter anything
+    const browseOnly = chubViewMode === 'timeline' ? []
+        : [chubFilterCustomPrompt, chubFilterExampleDialogues, chubExcludeForks];
+    const count = [chubFilterImages, chubFilterLore, chubFilterGreetings,
+                   ...browseOnly,
+                   chubFilterFavorites, chubFilterHideOwned, chubFilterHidePossible].filter(Boolean).length;
+
+    btn.classList.toggle('has-filters', count > 0);
+
     if (count > 0) {
         btn.innerHTML = `<i class="fa-solid fa-sliders"></i> Features (${count})`;
     } else {
         btn.innerHTML = `<i class="fa-solid fa-sliders"></i> Features`;
     }
+}
+
+function updateChubFeatureFilterAvailability() {
+    const inTimeline = chubViewMode === 'timeline';
+    for (const id of CHUB_BROWSE_ONLY_FILTER_IDS) {
+        const input = document.getElementById(id);
+        if (!input) continue;
+        input.disabled = inTimeline;
+        const row = input.closest('label.filter-checkbox');
+        if (!row) continue;
+        row.classList.toggle('browse-option-disabled', inTimeline);
+        if (inTimeline) row.title = 'Not available in the Following tab';
+        else row.removeAttribute('title');
+    }
+    updateChubFiltersButtonState();
 }
 
 function updateNsfwToggleState() {
@@ -1652,6 +1689,11 @@ function initChubTagsDropdown() {
     
     maxTokens?.addEventListener('change', (e) => {
         chubMaxTokens = parseInt(e.target.value) || 100000;
+        triggerChubReload();
+    });
+
+    document.getElementById('chubMinAiRating')?.addEventListener('change', (e) => {
+        chubMinAiRating = parseInt(e.target.value) || 0;
         triggerChubReload();
     });
 }
@@ -1833,7 +1875,7 @@ function updateChubTagsButtonState() {
     const includeCount = Array.from(chubTagFilters.values()).filter(v => v === 'include').length;
     const excludeCount = Array.from(chubTagFilters.values()).filter(v => v === 'exclude').length;
     
-    const hasAdvanced = chubSortAscending || chubMinTokens !== 50 || chubMaxTokens !== 100000;
+    const hasAdvanced = chubSortAscending || chubMinTokens !== 50 || chubMaxTokens !== 100000 || chubMinAiRating > 0;
     
     let text = 'Tags';
     const parts = [];
@@ -1856,10 +1898,12 @@ function updateChubTagsButtonState() {
 
 async function switchChubViewMode(mode) {
     chubViewMode = mode;
-    
+
     document.querySelectorAll('.chub-view-btn').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.chubView === mode);
     });
+
+    updateChubFeatureFilterAvailability();
     
     // Show/hide sections
     const browseSection = document.getElementById('chubBrowseSection');
@@ -2370,7 +2414,7 @@ function renderChubTimeline(appendOnly = false) {
 
     let sourceChars = chubTimelineCharacters;
 
-    const anyFilterActive = chubFilterImages || chubFilterLore || chubFilterExpressions ||
+    const anyFilterActive = chubFilterImages || chubFilterLore ||
         chubFilterGreetings || chubFilterHideOwned || chubFilterHidePossible || (chubFilterFavorites && chubUserFavoriteIds.size > 0) ||
         includeTags.length > 0 || excludeTags.length > 0;
     
@@ -2379,7 +2423,6 @@ function renderChubTimeline(appendOnly = false) {
         filteredCharacters = sourceChars.filter(c => {
             if (chubFilterImages && !(c.hasGallery || c.has_gallery)) return false;
             if (chubFilterLore && !(c.has_lore || c.related_lorebooks?.length > 0)) return false;
-            if (chubFilterExpressions && !c.has_expression_pack) return false;
             if (chubFilterGreetings && !(c.alternate_greetings?.length > 0 || c.n_greetings > 1)) return false;
             if (chubFilterHideOwned && isCharInLocalLibrary(c)) return false;
             if (chubFilterHidePossible && isCharPossibleMatchObj(c)) return false;
@@ -2754,9 +2797,32 @@ function performChubSearch() {
     loadChubCharacters();
 }
 
+// Chub assigns AI scores roughly two weeks after upload and min_ai_rating excludes unscored cards,
+// so any all-fresh result set returns 0 rows: trending, newcomer, and windows up to 14 days
+// (boundary verified live: max_days_ago=14 breaks, 15 works). Author views filter correctly but
+// lose the creator's sub-two-week cards. Mirrors the sort-branch selection in the param builder.
+function chubAiRatingSupported() {
+    if (chubAuthorFilter) return true;
+    const preset = CHUB_DISCOVERY_PRESETS[chubDiscoveryPreset] || CHUB_DISCOVERY_PRESETS['popular_week'];
+    if (preset.sort === 'trending' || preset.sort === 'trending_downloads') return false;
+    // Search mode drops special_mode and max_days_ago from the query, so those only block general browsing
+    if (chubCurrentSearch) return true;
+    return !preset.special_mode && !(preset.days > 0 && preset.days <= 14);
+}
+
+function updateChubAiRatingFieldState() {
+    const input = document.getElementById('chubMinAiRating');
+    if (!input) return;
+    const supported = chubAiRatingSupported();
+    input.disabled = !supported;
+    input.closest('.browse-advanced-option')?.classList.toggle('browse-option-disabled', !supported);
+}
+
 async function loadChubCharacters(forceRefresh = false) {
     const thisToken = ++chubLoadToken;
-    
+
+    updateChubAiRatingFieldState();
+
     const grid = document.getElementById('chubGrid');
 
     // Special handling for favorites filter - use gateway API directly
@@ -2788,7 +2854,7 @@ async function loadChubCharacters(forceRefresh = false) {
         params.set('page', chubCurrentPage.toString());
         params.set('nsfw', chubNsfwEnabled.toString());
         params.set('nsfl', chubNsfwEnabled.toString()); // NSFL follows NSFW setting
-        params.set('include_forks', 'true'); // Include forked characters
+        params.set('include_forks', chubExcludeForks ? 'false' : 'true'); // Exclude Forks toggle
         params.set('venus', 'false');
         
         if (chubCurrentSearch) {
@@ -2831,13 +2897,16 @@ async function loadChubCharacters(forceRefresh = false) {
         if (chubFilterLore) {
             params.set('require_lore', 'true');
         }
-        if (chubFilterExpressions) {
-            params.set('require_expressions', 'true');
-        }
         if (chubFilterGreetings) {
             params.set('require_alternate_greetings', 'true');
         }
-        
+        if (chubFilterCustomPrompt) {
+            params.set('require_custom_prompt', 'true');
+        }
+        if (chubFilterExampleDialogues) {
+            params.set('require_example_dialogues', 'true');
+        }
+
         // === Advanced Tag Filters ===
         // Include tags (topics)
         const includeTags = [];
@@ -2870,6 +2939,14 @@ async function loadChubCharacters(forceRefresh = false) {
         }
         if (chubMaxTokens !== 100000) {
             params.set('max_tokens', chubMaxTokens.toString());
+        }
+        if (chubMinAiRating > 0) {
+            if (chubAiRatingSupported()) {
+                params.set('min_ai_rating', chubMinAiRating.toString());
+            } else if (!chubAiRatingSortWarned) {
+                chubAiRatingSortWarned = true;
+                showToast('Min AI Score is ignored for the Trending, Hot This Week, Top Rated (Week), and Recent Hits sorts (ChubAI limitation)', 'info');
+            }
         }
 
         debugLog('[ChubAI] Search params:', params.toString());
@@ -3093,9 +3170,6 @@ async function loadChubFavorites(forceRefresh = false, loadToken = 0) {
         if (chubFilterLore) {
             nodes = nodes.filter(c => c.has_lore || c.related_lorebooks?.length > 0);
         }
-        if (chubFilterExpressions) {
-            nodes = nodes.filter(c => c.has_expression_pack);
-        }
         if (chubFilterGreetings) {
             nodes = nodes.filter(c => c.alternate_greetings?.length > 0 || c.n_greetings > 1);
         }
@@ -3214,6 +3288,10 @@ function renderChubGrid(appendOnly = false) {
 
     buildChubLookup(chubCardLookup, displayCharacters);
 
+    // A page whose characters all got client-filtered adds nothing visible; without this guard
+    // the else branch innerHTML-rebuilt the whole grid, teardown-flashing every loaded thumbnail.
+    if (appendOnly && chubGridRenderedCount === displayCharacters.length) return;
+
     if (appendOnly && chubGridRenderedCount > 0 && chubGridRenderedCount < displayCharacters.length) {
         // Only append new cards instead of rebuilding the entire grid
         const newChars = displayCharacters.slice(chubGridRenderedCount);
@@ -3291,9 +3369,6 @@ function createChubCard(char, isTimeline = false) {
     }
     if (char.has_lore || char.related_lorebooks?.length > 0) {
         badges.push('<span class="browse-feature-badge" title="Has Lorebook"><i class="fa-solid fa-book"></i></span>');
-    }
-    if (char.has_expression_pack) {
-        badges.push('<span class="browse-feature-badge" title="Has Expressions"><i class="fa-solid fa-face-smile"></i></span>');
     }
     if (char.alternate_greetings?.length > 0 || char.n_greetings > 1) {
         badges.push('<span class="browse-feature-badge" title="Alt Greetings"><i class="fa-solid fa-comment-dots"></i></span>');
@@ -3551,7 +3626,9 @@ async function openChubCharPreview(char) {
         greetingsStat.style.display = 'none';
     }
     
-    // Lorebook indicator
+    // Lorebook indicator. Search nodes no longer carry lore fields (timeline nodes still can);
+    // the detail fetch below upgrades this from the full data.
+    lorebookStat.title = '';
     if (char.has_lore || char.related_lorebooks?.length > 0) {
         lorebookStat.style.display = 'flex';
     } else {
@@ -3706,6 +3783,13 @@ async function openChubCharPreview(char) {
             greetingsCount.textContent = def.alternate_greetings.length + 1;
         }
 
+        // Lore scalars are precomputed at the strip step; the book itself is never cached.
+        // Visible text stays plain "Lorebook", the kind lives in the hover tooltip.
+        if (node.hasLinkedLorebook || node.hasWorldRef) {
+            lorebookStat.style.display = 'flex';
+            lorebookStat.title = node.hasLinkedLorebook ? 'Linked lorebook' : 'Embedded lorebook';
+        }
+
         // Alternate greetings list
         if (def.alternate_greetings) {
             renderAltGreetings(def.alternate_greetings);
@@ -3814,6 +3898,11 @@ async function openChubCharPreview(char) {
                             first_mes: node.definition.first_mes,
                             alternate_greetings: node.definition.alternate_greetings,
                         } : undefined,
+                        // Lore reduced to scalars so the stat can show without caching the book:
+                        // linked books arrive inlined as embedded_lorebook (related_lorebooks is a
+                        // presence sentinel), file-embedded books only ever hint via a world ref
+                        hasLinkedLorebook: !!(node.definition?.embedded_lorebook || node.related_lorebooks?.length > 0),
+                        hasWorldRef: !!node.definition?.extensions?.world,
                         galleryImages: galleryImages?.length > 0 ? galleryImages : undefined,
                         galleryAuthRequired: !!(galleryImages?._authRequired && !galleryImages.length),
                         hasGallery: char.hasGallery || node.hasGallery || false,

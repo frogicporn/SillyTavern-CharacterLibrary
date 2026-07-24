@@ -2284,6 +2284,10 @@ function renderWyvernGrid(appendOnly = false) {
 
     buildWyvernLookup(displayCharacters);
 
+    // A page whose characters all got client-filtered adds nothing visible; without this guard
+    // the else branch innerHTML-rebuilt the whole grid, teardown-flashing every loaded thumbnail.
+    if (appendOnly && wyvernGridRenderedCount === displayCharacters.length) return;
+
     if (appendOnly && wyvernGridRenderedCount > 0 && wyvernGridRenderedCount < displayCharacters.length) {
         const newChars = displayCharacters.slice(wyvernGridRenderedCount);
         if (newChars.length > 0) {

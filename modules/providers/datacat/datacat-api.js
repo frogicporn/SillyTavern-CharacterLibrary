@@ -6,6 +6,7 @@ import CoreAPI from '../../core-api.js';
 import { CL_HELPER_PLUGIN_BASE, slugify, stripHtml, fetchWithProxy } from '../provider-utils.js';
 import { getSearchToken, JANNY_SEARCH_URL, JANNY_SITE_BASE, TAG_MAP as JANNY_TAG_MAP } from '../janny/janny-api.js';
 import { resolveSaucepanImageUrl, SAUCEPAN_CDN_PROXY_BASE } from '../saucepan/saucepan-api.js';
+import { isJanitorBridgeAvailable, janitorBridgeFetch } from './janitor-bridge.js';
 
 export { slugify, stripHtml, JANNY_TAG_MAP };
 
@@ -48,16 +49,39 @@ export const DATACAT_JANITOR_IMAGE_BASE = 'https://ella.janitorai.com/bot-avatar
  * @param {Object} hit - DataCat character object (listing or detail)
  * @returns {string|null} Full URL (or local proxy path) or null if no avatar
  */
-export function resolveDatacatAvatarUrl(hit) {
-    const avatar = hit?.avatar;
-    if (!avatar || typeof avatar !== 'string') return null;
-    const proxied = resolveSaucepanImageUrl(avatar);
-    // Covers freshly rewritten URLs and already-proxied paths alike.
-    if (proxied.startsWith(SAUCEPAN_CDN_PROXY_BASE)) return proxied;
-    const url = /^https?:\/\//i.test(avatar) ? avatar : `${DATACAT_JANITOR_IMAGE_BASE}${avatar}`;
-    const safety = CoreAPI.isUrlSafeForDownload(url);
-    if (!safety.ok) return null;
-    return url;
+export function resolveDatacatAvatarUrl(hit, opts = {}) {
+    // preferOriginal (import / avatar viewer): hit.avatar on datacat-native rows is their 640px
+    // card variant, but the detail payload's embedded V2 json still points at the untouched
+    // janitorai original (1024px+, CORS-open) and the hero variant is 768px. The absolute-URL
+    // guard on the v2 candidates skips ST's 'none' convention and bare filenames. Listing rows
+    // carry none of the extra fields and fall through to hit.avatar, ie. todays behavior.
+    const absOnly = (c) => (typeof c === 'string' && /^https?:\/\//i.test(c) ? c : null);
+    const candidates = opts.preferOriginal
+        ? [
+            absOnly(hit?.chara_card_v2_json?.data?.avatar),
+            absOnly(hit?.content_variants?.[0]?.content?.chara_card_v2_json?.data?.avatar),
+            hit?.avatar_variant_urls?.hero || hit?.avatarVariantUrls?.hero,
+            hit?.avatar,
+        ]
+        : [hit?.avatar];
+    for (const avatar of candidates) {
+        if (!avatar || typeof avatar !== 'string') continue;
+        // Saucepan-sourced rows need the cl-helper CDN proxy, not a direct fetch.
+        // Covers freshly rewritten URLs and already-proxied paths alike.
+        const proxied = resolveSaucepanImageUrl(avatar);
+        if (proxied.startsWith(SAUCEPAN_CDN_PROXY_BASE)) return proxied;
+        let url = /^https?:\/\//i.test(avatar) ? avatar : `${DATACAT_JANITOR_IMAGE_BASE}${avatar}`;
+        const safety = CoreAPI.isUrlSafeForDownload(url);
+        if (!safety.ok) continue;
+        // Grid cards pass a width to pull a thumbnail: janitorai's raw bot-avatars are full-size
+        // originals, so decoding them into ~150px card slots is what makes hampter grids chug.
+        // datacat-native rows already resolve to an optimized card.webp variant, so skip them.
+        if (opts.width && /(^|\.)janitorai\.com$/i.test((() => { try { return new URL(url).hostname; } catch { return ''; } })())) {
+            url += (url.includes('?') ? '&' : '?') + `width=${opts.width}`;
+        }
+        return url;
+    }
+    return null;
 }
 
 // Minimum token threshold for quality filtering (matches DataCat's own frontend default)
@@ -243,7 +267,7 @@ export async function clearDcSession() {
 // ========================================
 // JANITORAI ACCOUNT AUTH (Supabase GoTrue)
 // ========================================
-// Unlocks page 2+ of the Hampter Trending/Popular sorts. JanitorAI auth is Supabase; the
+// Unlocks page 2+ of the Hampter sorts. JanitorAI auth is Supabase; the
 // anon key below is their PUBLIC publishable key (role:anon), shipped in the janitorai
 // frontend bundle, safe to embed. Login/refresh hit supabase.co directly (CORS *, and it is
 // NOT behind JanitorAI's Cloudflare bot gate), so the whole flow is client-side, no cl-helper.
@@ -438,14 +462,18 @@ export async function fetchDatacatCreatorCharacters(creatorId, opts = {}) {
  * @param {number} [opts.limit=24]
  * @param {number} [opts.offset=0]
  * @param {number[]} [opts.tagIds] - Active tag ID filters
+ * @param {string} [opts.search] - Full text search (matches character AND creator names)
+ * @param {string} [opts.sortBy] - Result order; the endpoint honors only 'score' (verified live)
  * @param {number} [opts.minTotalTokens=MIN_TOTAL_TOKENS]
  * @returns {Promise<{totalCount: number, characters: Object[]}|null>}
  */
 export async function fetchRecentPublic(opts = {}) {
-    const { limit = 24, offset = 0, tagIds = [], minTotalTokens = MIN_TOTAL_TOKENS } = opts;
+    const { limit = 24, offset = 0, tagIds = [], search = '', sortBy = '', minTotalTokens = MIN_TOTAL_TOKENS } = opts;
     try {
         let path = `/api/characters/recent-public?limit=${limit}&offset=${offset}&summary=1&minTotalTokens=${minTotalTokens}`;
         if (tagIds.length > 0) path += `&tagIds=${tagIds.join(',')}`;
+        if (search) path += `&search=${encodeURIComponent(search)}`;
+        if (sortBy) path += `&sortBy=${encodeURIComponent(sortBy)}`;
         const response = await dcFetch(path);
         if (!response.ok) return null;
         const data = await response.json();
@@ -975,77 +1003,6 @@ export async function searchMeiliJanny(opts = {}) {
 // ========================================
 
 const HAMPTER_API_BASE = 'https://janitorai.com/hampter/characters';
-const FLARESOLVERR_FETCH_PATH = `${CL_HELPER_PLUGIN_BASE}/flaresolverr-fetch`;
-const FLARESOLVERR_SESSION_CREATE_PATH = `${CL_HELPER_PLUGIN_BASE}/flaresolverr-session-create`;
-const FLARESOLVERR_SESSION_DESTROY_PATH = `${CL_HELPER_PLUGIN_BASE}/flaresolverr-session-destroy`;
-
-/**
- * Create a FlareSolverr session. Sessions keep a Chromium instance hot, so
- * subsequent fetches reuse the cached cf_clearance cookie and skip the
- * challenge - dropping each request from ~5-15s to ~1-3s.
- * @param {string} flareUrl
- * @returns {Promise<string>} the created session ID
- */
-export async function createFlareSolverrSession(flareUrl) {
-    if (!_apiRequest) throw new Error('cl-helper plugin not available');
-    const resp = await _apiRequest(FLARESOLVERR_SESSION_CREATE_PATH, 'POST', { flareUrl });
-    let payload = null;
-    try { payload = await resp.clone().json(); } catch { /* ignore */ }
-    if (!resp.ok || payload?.status !== 'ok' || !payload?.session) {
-        throw new Error(payload?.error || payload?.message || 'Failed to create FlareSolverr session');
-    }
-    return payload.session;
-}
-
-/**
- * Destroy a FlareSolverr session. Best-effort; does not throw on failure.
- * @param {string} flareUrl
- * @param {string} sessionId
- */
-export async function destroyFlareSolverrSession(flareUrl, sessionId) {
-    if (!_apiRequest || !sessionId) return;
-    try {
-        await _apiRequest(FLARESOLVERR_SESSION_DESTROY_PATH, 'POST', { flareUrl, sessionId });
-    } catch (err) {
-        console.warn('[DatacatAPI] FlareSolverr session destroy failed:', err.message);
-    }
-}
-
-/**
- * Fetch a URL via the user's configured FlareSolverr instance through cl-helper.
- * Returns the response body as text on success, or throws on failure.
- * @param {string} flareUrl - User-configured FlareSolverr endpoint (e.g. http://localhost:8191/v1)
- * @param {string} targetUrl - Target URL to fetch through FlareSolverr
- * @param {string} [sessionId] - Optional session ID to reuse a hot Chromium instance
- * @returns {Promise<string>}
- */
-async function fetchViaFlareSolverr(flareUrl, targetUrl, sessionId = '') {
-    if (!_apiRequest) throw new Error('cl-helper plugin not available');
-    const body = { flareUrl, targetUrl };
-    if (sessionId) body.sessionId = sessionId;
-    const resp = await _apiRequest(FLARESOLVERR_FETCH_PATH, 'POST', body);
-    let payload = null;
-    try { payload = await resp.clone().json(); } catch { /* ignore */ }
-    if (!resp.ok) {
-        const msg = payload?.error || `FlareSolverr request failed (HTTP ${resp.status})`;
-        const err = new Error(msg);
-        if (payload?.message && /session/i.test(payload.message)) err.sessionInvalid = true;
-        throw err;
-    }
-    if (payload?.status !== 'ok' || !payload?.solution) {
-        const msg = payload?.message || 'FlareSolverr did not return a solution';
-        const err = new Error(msg);
-        if (msg && /session/i.test(msg)) err.sessionInvalid = true;
-        throw err;
-    }
-    const upstreamStatus = payload.solution.status;
-    if (typeof upstreamStatus === 'number' && upstreamStatus >= 400) {
-        const err = new Error(`Upstream HTTP ${upstreamStatus}`);
-        err.status = upstreamStatus;
-        throw err;
-    }
-    return payload.solution.response || '';
-}
 
 /**
  * Fetch characters from JanitorAI's Hampter API (trending/popular sort).
@@ -1054,12 +1011,11 @@ async function fetchViaFlareSolverr(flareUrl, targetUrl, sessionId = '') {
  * @param {number} [opts.page=1]
  * @param {string} [opts.search='']
  * @param {boolean} [opts.nsfw=true] - false adds mode=sfw
- * @param {string} [opts.flareSolverrUrl] - Fallback: route through this FlareSolverr instance (only when the direct fetch was blocked)
- * @param {string} [opts.flareSessionId] - Reuse this FlareSolverr session for hot-Chromium speedup
+ * @param {string} [opts.authToken] - JanitorAI bearer; unlocks page 2+ of these sorts (rides either transport)
  * @returns {Promise<{characters: Object[], total: number, page: number, pageSize: number}>}
  */
 export async function fetchHampterCharacters(opts = {}) {
-    const { sort = 'trending', page = 1, search = '', nsfw = true, flareSolverrUrl = '', flareSessionId = '', authToken = '' } = opts;
+    const { sort = 'trending', page = 1, search = '', nsfw = true, authToken = '' } = opts;
     const params = new URLSearchParams({ sort, page: String(page) });
     if (search) params.set('search', search);
     if (!nsfw) params.set('mode', 'sfw');
@@ -1067,40 +1023,40 @@ export async function fetchHampterCharacters(opts = {}) {
     const url = `${HAMPTER_API_BASE}?${params}`;
     let data;
 
-    if (flareSolverrUrl) {
+    // Preferred transport: the userscript's GM_xmlhttpRequest carries cf_clearance, so it passes
+    // Cloudflare reliably; the direct fetch below only gets through when CF isn't challenging.
+    // The Bearer rides whichever transport runs (login is orthogonal to the CF gate).
+    // A transport failure falls through to the best-effort direct fetch below.
+    if (isJanitorBridgeAvailable()) {
+        let res = null;
         try {
-            const text = await fetchViaFlareSolverr(flareSolverrUrl, url, flareSessionId);
-            // FlareSolverr wraps JSON responses in HTML <pre> tags. Strip them.
-            const cleaned = text.replace(/^[\s\S]*?<pre[^>]*>/i, '').replace(/<\/pre>[\s\S]*$/i, '').trim();
-            try {
-                data = JSON.parse(cleaned || text);
-            } catch {
-                throw new Error('FlareSolverr returned non-JSON body');
-            }
-        } catch (err) {
-            if (err.status === 401) {
-                // App-level login gate (page 2+ anonymously); no client can pass it, dont retry.
-                const gated = new Error('JanitorAI requires signing in for this request');
-                gated.code = 'HAMPTER_LOGIN_REQUIRED';
+            res = await janitorBridgeFetch(url, authToken);
+        } catch { res = null; }
+        if (res) {
+            if (res.status === 401) {
+                const gated = new Error(authToken ? 'JanitorAI session expired' : 'JanitorAI requires signing in for this request');
+                gated.code = authToken ? 'HAMPTER_TOKEN_EXPIRED' : 'HAMPTER_LOGIN_REQUIRED';
                 gated.status = 401;
                 throw gated;
             }
-            if (err.status === 403) {
-                const blocked = new Error(`Hampter HTTP ${err.status}`);
+            if (!res.ok) {
+                const blocked = new Error(`Hampter HTTP ${res.status}`);
                 blocked.code = 'HAMPTER_BLOCKED';
-                blocked.status = err.status;
+                blocked.status = res.status;
                 throw blocked;
             }
-            const wrapped = new Error(`FlareSolverr: ${err.message}`);
-            wrapped.code = 'FLARESOLVERR_ERROR';
-            if (err.sessionInvalid) wrapped.sessionInvalid = true;
-            throw wrapped;
+            try {
+                data = JSON.parse(res.body);
+            } catch {
+                throw new Error('JanitorAI bridge returned non-JSON body');
+            }
         }
-    } else {
-        // Direct browser fetch: hampter serves CORS * and browser TLS passes the bot gate that
-        // 403s every server-side client. Deliberately not fetchWithProxy (the /proxy/ leg cant
-        // pass, and a poisoned _proxyOrigins entry would skip the working direct attempt).
-        // A JanitorAI bearer (Authorization is CORS-allowed here) unlocks page 2+ of these sorts.
+    }
+
+    if (data === undefined) {
+        // Best-effort direct browser fetch. Hampter serves CORS *, but a cross-origin fetch cannot
+        // send janitorai's cf_clearance cookie, so Cloudflare usually 403s it; the userscript bridge
+        // above is the reliable path. Deliberately not fetchWithProxy (the /proxy/ leg cant pass).
         const headers = { 'Accept': 'application/json' };
         if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
         let response = null;

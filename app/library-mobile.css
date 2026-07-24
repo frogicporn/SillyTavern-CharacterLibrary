@@ -519,6 +519,8 @@ html.cl-mobile .mobile-sheet {
 html.cl-mobile .mobile-sheet.open { transform: translateY(0); }
 html.cl-mobile .mobile-sheet-handle {
     width: 40px; height: 4px;
+    /* Overflowing flex-column hosts (the relocated filter popups) squash unarmored children thinner. */
+    flex-shrink: 0;
     background: var(--text-faint);
     opacity: 0.4;
     border-radius: var(--radius-2xs);
@@ -852,6 +854,21 @@ html.cl-mobile .mobile-avatar-viewer img {
     object-fit: contain;
     border-radius: var(--radius-lg);
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+}
+/* Full-res load indicator; reveal is delayed so fast/cached opens never flash it */
+html.cl-mobile .mobile-avatar-viewer .mobile-av-spinner {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: var(--font-3xl);
+    color: var(--text-primary);
+    pointer-events: none;
+    opacity: 0;
+    animation: mobileAvSpinnerIn 0s linear 0.15s forwards;
+}
+@keyframes mobileAvSpinnerIn {
+    to { opacity: 1; }
 }
 
 /* Browse avatar viewer - mobile overrides (single image; galleries use the shared gallery viewer) */
@@ -1972,9 +1989,10 @@ html.cl-mobile .import-urls-textarea {
     resize: vertical;
 }
 
-/* Import source toggle */
+/* Import source toggle; shrink-armored: the flex-column body would squash it when the taller panel overflows */
 html.cl-mobile .import-source-toggle {
     margin-bottom: 10px;
+    flex-shrink: 0;
 }
 html.cl-mobile .import-source-btn {
     padding: 10px 12px;

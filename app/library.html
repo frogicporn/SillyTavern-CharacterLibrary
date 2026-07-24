@@ -5,9 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=overlays-content">
     <meta name="color-scheme" content="dark">
     <meta name="referrer" content="no-referrer">
+    <meta name="character-library" content="1"><!-- marker for the optional JanitorAI bridge userscript -->
     <title>SillyTavern Character Library</title>
-    <link rel="stylesheet" href="library.css?v=106">
-    <link rel="stylesheet" href="library-mobile.css?v=35">
+    <link rel="stylesheet" href="library.css?v=107">
+    <link rel="stylesheet" href="library-mobile.css?v=36">
     <!-- Noto Sans from SillyTavern's bundled webfonts -->
     <link rel="stylesheet" href="/webfonts/NotoSans/stylesheet.css">
     <!-- Font Awesome for Icons -->
@@ -1519,17 +1520,18 @@ https://jannyai.com/characters/uuid_slug
                             </ul>
                             <p class="info-tip"><i class="fa-solid fa-lightbulb"></i> Configure provider order in Settings → Online. NSFW preference is remembered from each provider toggle.</p>
                         </div>
-                        <div class="info-section">
+                        <div class="info-section" id="helpDatacatHampter">
                             <h4><i class="fa-solid fa-cat"></i> DataCat / JanitorAI</h4>
                             <p>The DataCat provider combines multiple data sources to give you the best coverage for JanitorAI characters. Each sort order pulls from a different source:</p>
-                            <p><strong>DataCat sort orders</strong> (Recent, Fresh 24h/7d):</p>
+                            <p><strong>DataCat sort orders</strong> (Recent, plus Freshest / Score / Chat Count and more over 24h and 7d windows):</p>
                             <ul>
                                 <li>Characters come from <strong>DataCat's own database</strong>, which mirrors JanitorAI</li>
                                 <li>Full character definitions are available (personality, scenario, first message, etc.)</li>
                                 <li>Tags use DataCat's own category system</li>
                                 <li>Creator names are always available</li>
                                 <li>One-click import with complete card data</li>
-                                <li>The search bar only accepts <strong>DataCat or JanitorAI URLs</strong> and <strong>creator UUIDs</strong>. No text search</li>
+                                <li>The search bar supports <strong>text search</strong> (matches character names, creators, and tags), plus <strong>DataCat or JanitorAI URLs</strong> and <strong>creator UUIDs</strong> for direct lookup. Typing a creator name jumps to their full catalog even with nothing loaded yet</li>
+                                <li>The Tags dropdown filters by any of DataCat's tags</li>
                             </ul>
                             <p><strong>JanitorAI (MeiliSearch)</strong> sort orders (Newest, Oldest, Most/Least Tokens, Relevant):</p>
                             <ul>
@@ -1537,10 +1539,10 @@ https://jannyai.com/characters/uuid_slug
                                 <li>Covers <strong>all published characters</strong> on JanitorAI</li>
                                 <li>The search bar supports <strong>text search</strong> (searches character names and descriptions) as well as <strong>JanitorAI URLs</strong> for direct lookup</li>
                                 <li>Tags use JanitorAI's own tag system (Male, Female, Anime, etc.)</li>
-                                <li>Creator names may be missing on grid cards (MeiliSearch doesn't always include them), but will appear in the preview modal if the character exists on DataCat</li>
+                                <li>Creator names can be blank on grid cards (JanitorAI's search index omits them for some characters); they fill in on the preview when the character is also on DataCat</li>
                                 <li>Characters not yet on DataCat can be <strong>extracted</strong> on demand</li>
                             </ul>
-                            <p><strong>JanitorAI (Hampter)</strong> sort orders (Trending, Popular):</p>
+                            <p><strong>JanitorAI (Hampter)</strong> sort orders (Latest, Trending, Trending 24h, Popular, Relevance):</p>
                             <ul>
                                 <li>Pulls from JanitorAI's curated <strong>trending/popular feed</strong></li>
                                 <li>Only surfaces characters with significant engagement, not a complete index</li>
@@ -1548,7 +1550,7 @@ https://jannyai.com/characters/uuid_slug
                                 <li>Tag filtering is not available in this mode</li>
                                 <li>Creator names are always available</li>
                             </ul>
-                            <p><strong>Hampter access:</strong> Trending/popular loads directly in the browser with no setup. JanitorAI serves only the <strong>first page</strong> of these sorts anonymously; add your <strong>JanitorAI login</strong> (Settings &rarr; Online &rarr; DataCat) to page through more. You paste your session cookie once and the login then refreshes itself, no repeated pasting. If Cloudflare ever blocks a fetch, an optional <a href="https://github.com/FlareSolverr/FlareSolverr" target="_blank" rel="noopener noreferrer">FlareSolverr</a> instance is used as a backup fetcher. The other DataCat and JanitorAI sort orders are unaffected.</p>
+                            <p><strong>Hampter access:</strong> JanitorAI's Hampter sorts sit behind Cloudflare. A direct load straight from your browser sometimes gets through, but Cloudflare usually blocks it, so for dependable access install the companion <strong>userscript</strong> (<code>extras/cl-janitor-bridge.user.js</code>, in Tampermonkey or Violentmonkey); it makes the Cloudflare-gated request from your own browser reliably. Add your <strong>JanitorAI login</strong> (Settings &rarr; Online &rarr; DataCat) to page past the first page; the session then refreshes itself, no repeated pasting. Tested on desktop; on mobile, a userscript-capable browser (e.g. Firefox for Android) or a mobile-specific solution that routes the request through a webview works too. The other DataCat and JanitorAI (MeiliSearch) sort orders are unaffected and need no setup.</p>
                             <p><strong>Across all modes:</strong> Pasting a <strong>JanitorAI character URL</strong> into the search bar will look up the character on DataCat. If it's found, the preview opens directly. If not, an extraction panel appears letting you request the character from DataCat's cloud service.</p>
                             <p><strong>Extraction:</strong> When a character only exists on JanitorAI and hasn't been indexed by DataCat yet, the Import button changes to <strong>Extract</strong>. This sends a request to DataCat's cloud service, which visits the JanitorAI page and retrieves the full character definition. You can also paste a JanitorAI URL directly into the search bar to look up and extract specific characters.</p>
                             <p class="info-tip"><i class="fa-solid fa-lightbulb"></i> DataCat requires the cl-helper server plugin. Install it from Settings → Online → DataCat.</p>
@@ -1644,8 +1646,8 @@ https://jannyai.com/characters/uuid_slug
                             <p>Find potential duplicates in your library:</p>
                             <ul>
                                 <li>Open from <strong>More Options (⋮) → Find Duplicates</strong></li>
-                                <li>Compares character name, creator, description, tags, and lorebook entries</li>
-                                <li>Shows a similarity score (0-100%) for each match</li>
+                                <li>Compares character name, creator, description, first message, personality, scenario, and creator's notes</li>
+                                <li>Rates each match with a similarity label (Possible Match up to Identical) plus a per-field score breakdown</li>
                                 <li>Review matches and delete unwanted duplicates</li>
                             </ul>
                             <p class="info-tip"><i class="fa-solid fa-lightbulb"></i> Adjust the minimum score threshold in Settings to control sensitivity.</p>
@@ -1728,13 +1730,14 @@ https://jannyai.com/characters/uuid_slug
                                 <li><strong>Civitai</strong>: posts and image collections (public out-of-the-box; private/hidden posts require an API key)</li>
                                 <li><strong>Imgchest</strong>: public and password-protected posts (passwords are auto-detected from the card's creator notes / description via regex; password-protected posts require cl-helper)</li>
                                 <li><strong>Mega.nz</strong>: public folder shares with multi-pass folder traversal</li>
-                                <li><strong>Imgur, PostImg, ImgBB, Imgbox</strong>: albums and individual images</li>
+                                <li><strong>PostImg, ImgBB, Imgbox</strong>: albums and individual images</li>
+                                <li><strong>Pixiv</strong>: artwork pages (requires cl-helper; R-18 works need your Pixiv login in Settings → Media)</li>
                                 <li><strong>Catbox</strong>: direct file URLs</li>
                                 <li><strong>Dropbox</strong>: shared folders and individual file links</li>
                                 <li><strong>Google Drive</strong>: shared folders and individual files</li>
                             </ul>
                             <p>Extractors run automatically when you trigger <strong>Download Embedded Media</strong> from the Gallery tab or use Bulk Localization. No configuration is required for public content.</p>
-                            <p class="info-tip"><i class="fa-solid fa-key"></i> <strong>Civitai API key:</strong> Required only for private or hidden Civitai posts. Configure in Settings → Media → Civitai API Key. Generate at <code>civitai.com/user/account</code>. The key is stored persistently and pushed to the cl-helper plugin at startup, so it stays server-side at request time.</p>
+                            <p class="info-tip"><i class="fa-solid fa-key"></i> <strong>Civitai API key:</strong> Required only for private or hidden Civitai posts. Configure in Settings → Media → Civitai API Key. Generate at <code>civitai.com/user/account</code>. The key is stored persistently and pushed to the cl-helper plugin when you save it (re-synced automatically if the plugin restarts), so it stays server-side at request time.</p>
                         </div>
                     </div>
 
@@ -1754,7 +1757,7 @@ https://jannyai.com/characters/uuid_slug
                                 <li>Add individual characters to a playlist from the result card, or use <strong>Add all to playlist</strong> to save every recommendation at once</li>
                                 <li><strong>Reroll</strong> to re-run with the same prompt and settings; previously picked characters are excluded so you get fresh suggestions</li>
                             </ul>
-                            <p class="info-tip"><i class="fa-solid fa-lightbulb"></i> The recommender only sends character names, tags, creator, and taglines, not conversation history or full card text.</p>
+                            <p class="info-tip"><i class="fa-solid fa-lightbulb"></i> The recommender sends character names, tags, creator, taglines, and creator notes (short excerpts); optionally the description if you enable it in its settings. Conversation history is never sent.</p>
                         </div>
                         <div class="info-section">
                             <h4><i class="fa-solid fa-list-check"></i> Multi-Select & Batch Operations</h4>
@@ -1801,7 +1804,7 @@ https://jannyai.com/characters/uuid_slug
                     <div class="help-panel" data-section="character-creator">
                         <div class="info-section">
                             <h4><i class="fa-solid fa-plus-circle"></i> Overview</h4>
-                            <p>Create new characters from scratch or edit existing ones with AI assistance. Open via <strong>⋮ menu → Create a Character</strong>.</p>
+                            <p>Create new characters from scratch or edit existing ones with AI assistance. Open via <strong>⋮ menu → Create Character</strong>.</p>
                             <p>Each card field (description, personality, scenario, first message, etc.) has a <strong>wand icon button</strong> that opens the <strong>AI Studio</strong> panel for that field.</p>
                         </div>
                         <div class="info-section">
@@ -1901,7 +1904,7 @@ https://jannyai.com/characters/uuid_slug
                             <p>The <strong>⋮ More Options</strong> button in the topbar contains additional tools:</p>
                             <ul>
                                 <li><strong>Import Characters</strong>: Import from URL or local PNG file</li>
-                                <li><strong>Create a Character</strong>: AI-assisted character creation (see Character Creator section)</li>
+                                <li><strong>Create Character</strong>: AI-assisted character creation (see Character Creator section)</li>
                                 <li><strong>Find Duplicates</strong>: Scan your library for potential duplicate characters</li>
                                 <li><strong>Auto-Link Characters</strong>: Bulk-link unlinked characters to providers</li>
                                 <li><strong>Card Recommender</strong>: AI-powered character recommendations</li>
@@ -2684,7 +2687,10 @@ https://jannyai.com/characters/uuid_slug
                                 <div class="settings-group">
                                     <div class="settings-group-title"><i class="fa-solid fa-user-lock"></i> JanitorAI Login (Hampter pagination) <span class="settings-provider-badge">WIP</span></div>
                                     <div class="settings-row">
-                                        <span class="settings-hint">Optional. JanitorAI serves only the <strong>first page</strong> of the Trending/Popular sorts without an account. Paste your session cookie to page through more; the session then <strong>refreshes itself</strong> (no repeated pasting). To get it: log in at <strong>janitorai.com</strong>, open DevTools (F12) &rarr; <strong>Application &rarr; Cookies &rarr; janitorai.com</strong>, and copy the value of the <strong>sb-auth-auth-token</strong> cookie. Stored locally in your browser. Tip: paste from a browser you are not actively browsing JanitorAI in, so the two sessions do not rotate each other out.</span>
+                                        <span class="settings-hint">Optional. JanitorAI serves only the <strong>first page</strong> of the Hampter sorts without an account. Paste your session cookie to page through more; the session then <strong>refreshes itself</strong> (no repeated pasting). To get it: log in at <strong>janitorai.com</strong>, open DevTools (F12) &rarr; <strong>Application &rarr; Cookies &rarr; janitorai.com</strong>, and copy the value of the <strong>sb-auth-auth-token</strong> cookie. Stored locally in your browser. Tip: paste from a browser you are not actively browsing JanitorAI in, so the two sessions do not rotate each other out.</span>
+                                    </div>
+                                    <div class="settings-row">
+                                        <span class="settings-hint"><strong>Getting past Cloudflare:</strong> JanitorAI's Hampter sort orders sit behind Cloudflare. They occasionally load directly, but Cloudflare usually blocks the direct fetch, so for reliable access install the companion userscript (<code>extras/cl-janitor-bridge.user.js</code>) in a userscript manager like Tampermonkey or Violentmonkey; it makes the request from your own browser, which Cloudflare trusts. <strong>Tested on desktop.</strong> On mobile, a userscript-capable browser (e.g. Firefox for Android), or a mobile-specific solution that routes the request through a webview, works too. The userscript gives you the first page reliably; the login above is what pages past it. The other DataCat and JanitorAI sort orders need none of this. <a href="#" id="hampterHelpLink">More in Help &amp; Tips.</a></span>
                                     </div>
                                     <div class="settings-row">
                                         <label>Cookie:</label>
@@ -2708,30 +2714,19 @@ https://jannyai.com/characters/uuid_slug
                                     </div>
                                 </div>
                                 <div class="settings-group">
-                                    <div class="settings-group-title"><i class="fa-solid fa-fire"></i> FlareSolverr (Hampter fallback)</div>
-                                    <div class="settings-row">
-                                        <span class="settings-hint">Optional fallback. JanitorAI's <strong>Trending</strong> and <strong>Popular</strong> sort orders normally load directly with no setup; if Cloudflare ever blocks that direct fetch, a <a href="https://github.com/FlareSolverr/FlareSolverr" target="_blank" rel="noopener noreferrer">FlareSolverr</a> instance configured here is used as a backup fetcher. JanitorAI serves only the first page of these sorts without an account, regardless of fetch method.</span>
-                                    </div>
-                                    <div class="settings-row">
-                                        <label>URL:</label>
-                                        <div class="settings-input-group">
-                                            <input type="url" id="settingsDatacatFlareSolverrUrl" class="glass-input" placeholder="http://localhost:8191/v1" autocomplete="off">
-                                            <button id="testDatacatFlareSolverrBtn" class="settings-verify-btn" title="Test FlareSolverr connection">
-                                                <i class="fa-solid fa-plug-circle-check"></i>
-                                            </button>
-                                        </div>
-                                    </div>
-                                    <div class="settings-row">
-                                        <span id="datacatFlareSolverrStatus" class="settings-status-badge inactive"><i class="fa-solid fa-circle"></i> Not configured</span>
-                                    </div>
-                                </div>
-                                <div class="settings-group">
                                     <div class="settings-group-title"><i class="fa-solid fa-ban"></i> Exclude Tags <i class="fa-solid fa-circle-info datacat-exclude-info" title="Client-side filter, case-insensitive on tag slugs (eg. female, nsfw).&#10;&#10;DataCat's default unsorted view returns no tag data, so excludes have no effect there; switch to any sort (Fresh, JanitorAI) to enable filtering."></i></div>
                                     <div class="settings-row">
                                         <div class="provider-exclude-tags-container">
                                             <div class="provider-exclude-tags-pills" id="datacatExcludeTagsPills"></div>
                                             <input type="text" class="glass-input provider-exclude-tags-input" id="datacatExcludeTagsInput" placeholder="Type a tag and press Enter" autocomplete="off">
                                         </div>
+                                    </div>
+                                </div>
+                                <div class="settings-group">
+                                    <div class="settings-group-title"><i class="fa-solid fa-image"></i> Card Maintenance</div>
+                                    <div class="settings-row">
+                                        <button id="datacatRestoreAvatarsBtn" class="settings-action-btn primary"><i class="fa-solid fa-wand-magic-sparkles"></i> Restore Original Avatars</button>
+                                        <span class="settings-hint">Cards imported before mid-July 2026 carry DataCat's downsized 640px card image. This scans your DataCat-linked characters, shows the current and original avatars side by side, and replaces only the ones you approve. Card data is never modified, only the image.</span>
                                     </div>
                                 </div>
                             </div>
@@ -3361,8 +3356,8 @@ https://jannyai.com/characters/uuid_slug
     <div id="toastContainer" class="toast-container"></div>
 
     <!-- Scripts -->
-    <script src="library.js?v=195"></script>
-    <script type="module" src="../modules/module-loader.js?v=46"></script>
-    <script src="library-mobile.js?v=24"></script>
+    <script src="library.js?v=196"></script>
+    <script type="module" src="../modules/module-loader.js?v=47"></script>
+    <script src="library-mobile.js?v=25"></script>
 </body>
 </html>

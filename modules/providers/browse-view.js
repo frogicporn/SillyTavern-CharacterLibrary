@@ -1040,7 +1040,12 @@ export class BrowseView {
                 if (realSrc && !img.dataset.failed && img.src !== realSrc) {
                     BrowseView.loadImage(img, realSrc);
                 }
+                // Load is one-directional; stop tracking once triggered so the observed set
+                // shrinks on deep scrolls instead of growing with every card ever rendered.
+                this._imageObserver.unobserve(img);
             }
+        // Modest image lookahead, deliberately NOT the multi-viewport card-fetch buffer: decoding
+        // a viewport-scaled band of images ahead is what chugged large-avatar grids (hampter).
         }, { rootMargin: '600px' });
     }
 
@@ -1195,7 +1200,11 @@ export class BrowseView {
      */
     _getScrollThreshold() {
         const zoom = parseFloat(document.body.style.zoom) || 1;
-        return 1500 / zoom;
+        // This is the maintained content BUFFER below the scroll position, not just a trigger line:
+        // the post-render deferred check keeps loading until this much content sits below you. Four
+        // viewports rides out a slow provider round trip mid-fling; the legacy floor covers tiny panes.
+        const viewport = document.querySelector('.gallery-content')?.clientHeight || 0;
+        return Math.max(1500 / zoom, viewport * 4);
     }
 
     _attachScrollListener() {
@@ -2052,11 +2061,19 @@ export class BrowseView {
         overlay.id = 'browseAvatarViewer';
         overlay.className = 'browse-avatar-viewer';
 
+        // Covers the first-tap fetch when src is a bigger asset than the modal header showed;
+        // the CSS reveal delay keeps fast/cached opens from ever flashing it.
+        const spinner = document.createElement('div');
+        spinner.className = 'browse-av-spinner';
+        spinner.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>';
+
         const img = document.createElement('img');
         img.className = 'browse-av-image';
         img.alt = 'Image';
-        img.onerror = () => { img.onerror = null; if (fallbackSrc) img.src = fallbackSrc; else img.style.display = 'none'; };
+        img.onload = () => spinner.remove();
+        img.onerror = () => { img.onerror = null; spinner.remove(); if (fallbackSrc) img.src = fallbackSrc; else img.style.display = 'none'; };
         img.src = src;
+        overlay.appendChild(spinner);
         overlay.appendChild(img);
 
         overlay.addEventListener('click', (e) => { if (e.target === overlay) BrowseView.closeAvatarViewer(); });

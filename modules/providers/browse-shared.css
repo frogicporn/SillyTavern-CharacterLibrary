@@ -843,6 +843,23 @@ h2.browse-title-scroll-end {
     -webkit-user-drag: none;
 }
 
+/* Full-res load indicator; reveal is delayed so fast/cached opens never flash it */
+.browse-avatar-viewer .browse-av-spinner {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: var(--font-3xl);
+    color: var(--text-primary);
+    pointer-events: none;
+    opacity: 0;
+    animation: browseAvSpinnerIn 0s linear 0.15s forwards;
+}
+
+@keyframes browseAvSpinnerIn {
+    to { opacity: 1; }
+}
+
 @keyframes avatarViewerFadeIn {
     from { opacity: 0; }
     to   { opacity: 1; }
@@ -1606,6 +1623,25 @@ body.collapse-all-browse-sections
     color: var(--text-secondary);
     font-size: var(--font-sm);
     width: 14px;
+}
+
+/* Filter rows whose option doesn't apply to the current view or sort */
+.browse-option-disabled {
+    opacity: 0.45;
+}
+
+.browse-option-disabled input,
+.browse-option-disabled select {
+    cursor: not-allowed;
+}
+
+/* Outrank the base row's pointer cursor + hover highlight so greyed rows don't signal clickability */
+.browse-more-filters .filter-checkbox.browse-option-disabled {
+    cursor: not-allowed;
+}
+
+.browse-more-filters .filter-checkbox.browse-option-disabled:hover {
+    background: none;
 }
 
 .glass-select-small,

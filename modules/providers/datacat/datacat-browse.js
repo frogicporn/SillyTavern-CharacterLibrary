@@ -29,8 +29,6 @@ import {
     JANNY_TAG_MAP,
     pickRecoveryVariant,
     stripDatacatMarkers,
-    createFlareSolverrSession,
-    destroyFlareSolverrSession,
 } from './datacat-api.js';
 // DataCat's index carries Saucepan-sourced rows; these helpers serve those rows
 // (creator lookups, lock-state detail, CDN image proxying). Browsing saucepan.ai
@@ -60,6 +58,7 @@ const {
     getProviderExcludeTags,
     renderLoadingState,
     renderSkeletonGrid,
+    openGalleryInfoModal,
 } = CoreAPI;
 
 // ========================================
@@ -111,6 +110,7 @@ let datacatActiveTagIds = new Set();
 let datacatTagGroups = [];
 let datacatTags = [];
 let datacatTagsLoaded = false;
+let datacatTagsLoading = false;
 
 // View mode: 'browse' or 'following'
 let datacatViewMode = 'browse';
@@ -130,6 +130,7 @@ const PAGE_SIZE = 80;
 // MeiliSearch (JanitorAI) state
 let meiliCurrentPage = 1;
 let meiliTotalPages = 0;
+let datacatSearchQuery = ''; // native feed text search (recent-public &search=, matches creator names too)
 let meiliSearchQuery = '';
 
 // Shared JanitorAI tag filter state (used by both MeiliSearch and Hampter modes)
@@ -139,51 +140,6 @@ let jannyActiveTagIds = new Set();
 let hampterCurrentPage = 1;
 let hampterTotalPages = 0;
 let hampterSearchQuery = '';
-
-// FlareSolverr session reuse state. Sessions keep a hot Chromium instance
-// so subsequent requests skip the Cloudflare challenge.
-let flareSession = { url: '', id: '' };
-let flareSessionPromise = null;
-
-/**
- * Ensure a FlareSolverr session exists for the given URL. Returns the session
- * ID, or '' if creation failed (caller should fall back to sessionless).
- *
- * Sessions are MUCH faster than sessionless requests on FlareSolverr - even
- * the very first in-session fetch beats sessionless by ~4-5x because cold
- * browser spawns dominate sessionless latency. Always prefer sessions.
- */
-async function ensureFlareSession(flareUrl) {
-    if (!flareUrl) return '';
-    if (flareSession.url === flareUrl && flareSession.id) return flareSession.id;
-    if (flareSession.url && flareSession.url !== flareUrl) {
-        const stale = flareSession;
-        flareSession = { url: '', id: '' };
-        destroyFlareSolverrSession(stale.url, stale.id);
-    }
-    if (flareSessionPromise) return flareSessionPromise;
-    flareSessionPromise = (async () => {
-        try {
-            const id = await createFlareSolverrSession(flareUrl);
-            flareSession = { url: flareUrl, id };
-            return id;
-        } catch (err) {
-            console.warn('[DatacatBrowse] FlareSolverr session create failed, falling back to sessionless:', err.message);
-            return '';
-        } finally {
-            flareSessionPromise = null;
-        }
-    })();
-    return flareSessionPromise;
-}
-
-function clearFlareSession() {
-    if (flareSession.url && flareSession.id) {
-        destroyFlareSolverrSession(flareSession.url, flareSession.id);
-    }
-    flareSession = { url: '', id: '' };
-    flareSessionPromise = null;
-}
 
 // Extraction state
 let extractionPollTimer = null;
@@ -271,7 +227,8 @@ function getSourceKind(hit) {
 function createDatacatCard(hit) {
     const name = hit.name || 'Unknown';
     const desc = stripHtml(hit.description) || '';
-    const avatarUrl = resolveDatacatAvatarUrl(hit) || '/img/ai4.png';
+    // Grid cards render ~150px; request a thumbnail so janitorai originals dont decode full-size
+    const avatarUrl = resolveDatacatAvatarUrl(hit, { width: 400 }) || '/img/ai4.png';
     const charId = getCharId(hit);
     const creatorName = getCreatorName(hit);
     const inLibrary = isCharInLocalLibrary(hit);
@@ -371,6 +328,33 @@ function observeNewCards() {
 // GRID RENDERING
 // ========================================
 
+let datacatAutoTopUps = 0; // chained top-up fetches since the last user-initiated load
+let datacatTopUpVisible = 0; // visible cards accumulated across those chained fetches
+
+// Single owner of the per-mode pagination advance; the Load More button, infinite scroll,
+// and the thin-page top-up chain all route through here. Offset modes (creator + the default
+// recents) have no pre-increment: their offset advances at response time by the rows the server
+// actually returned, because datacat clamps limit server-side (asked 80, returns 50) and a fixed
+// PAGE_SIZE stride was silently skipping the 30 rows between clamp and stride on every page.
+function advanceDatacatPage() {
+    if (datacatBrowseMode === 'creator') {
+        // response-time offset advance
+    } else if (isHampterSortMode(datacatSortMode)) {
+        hampterCurrentPage++;
+    } else if (isJannySortMode(datacatSortMode)) {
+        meiliCurrentPage++;
+    } else {
+        const parsed = parseSortMode(datacatSortMode);
+        // Mirrors isFreshMode: tag-filtered or searched fresh sorts load via the offset endpoint,
+        // so growing the fresh limits for them advanced nothing (the old stall) - they ride the offset
+        if (parsed && datacatActiveTagIds.size === 0 && !datacatSearchQuery) {
+            if (parsed.window === '24h') datacatFreshLimit24 += FRESH_PAGE_INCREMENT;
+            else datacatFreshLimitWeek += FRESH_PAGE_INCREMENT;
+        }
+    }
+    return loadCharacters(true);
+}
+
 function renderGrid(characters, append = false) {
     const grid = document.getElementById('datacatGrid');
     if (!grid) return;
@@ -428,8 +412,10 @@ function updateLoadMore() {
 
 async function loadCharacters(append = false) {
     if (append && datacatIsLoading) return;
+    if (!append) { datacatAutoTopUps = 0; datacatTopUpVisible = 0; }
     const thisToken = ++datacatLoadToken;
     datacatIsLoading = true;
+    let visibleNew = Infinity; // error paths must never trigger the top-up chain
 
     const grid = document.getElementById('datacatGrid');
     const loadMoreBtn = document.getElementById('datacatLoadMoreBtn');
@@ -437,20 +423,6 @@ async function loadCharacters(append = false) {
     if (!append && grid) {
         renderSkeletonGrid(grid);
     }
-
-    // Helper to update the loading sub-status line during long-running fetches.
-    const setLoadingSubstatus = (text) => {
-        if (append || !grid) return;
-        const labelEl = grid.querySelector('.cl-loading-label');
-        if (!labelEl) return;
-        let subEl = grid.querySelector('.cl-loading-substatus');
-        if (!subEl) {
-            subEl = document.createElement('div');
-            subEl.className = 'cl-loading-substatus';
-            labelEl.insertAdjacentElement('afterend', subEl);
-        }
-        subEl.textContent = String(text ?? '').replace(/[.\u2026]+\s*$/, '');
-    };
 
     if (loadMoreBtn) {
         loadMoreBtn.disabled = true;
@@ -520,7 +492,8 @@ async function loadCharacters(append = false) {
             };
             let data;
             try {
-                // Direct browser fetch is the normal path; FlareSolverr only backs up a blocked one.
+                // The userscript bridge (if installed) carries this past Cloudflare; otherwise the
+                // direct fetch is best-effort and usually blocked. See fetchHampterCharacters.
                 data = await fetchHampterCharacters(fetchOpts);
             } catch (err) {
                 // A 401 despite a token means it was rejected mid-session; refresh once and retry before giving up.
@@ -528,20 +501,8 @@ async function loadCharacters(append = false) {
                     const fresh = (await window.janitoraiForceRefresh?.()) || '';
                     if (!fresh) throw err;
                     data = await fetchHampterCharacters({ ...fetchOpts, authToken: fresh });
-                    // data now set; fall through to the shared list/total assignment below.
                 } else {
-                    const flareSolverrUrl = (getSetting('datacatFlareSolverrUrl') || '').trim();
-                    if (err?.code !== 'HAMPTER_BLOCKED' || !flareSolverrUrl) throw err;
-                    setLoadingSubstatus('Direct fetch was blocked; retrying through FlareSolverr (a cold session can take a while)...');
-                    const flareOpts = { ...fetchOpts, flareSolverrUrl, flareSessionId: await ensureFlareSession(flareSolverrUrl) };
-                    try {
-                        data = await fetchHampterCharacters(flareOpts);
-                    } catch (err2) {
-                        if (!err2?.sessionInvalid || !flareOpts.flareSessionId) throw err2;
-                        setLoadingSubstatus('FlareSolverr session expired; refreshing...');
-                        clearFlareSession();
-                        data = await fetchHampterCharacters({ ...flareOpts, flareSessionId: await ensureFlareSession(flareSolverrUrl) });
-                    }
+                    throw err;
                 }
             }
             list = data?.characters || [];
@@ -550,12 +511,18 @@ async function loadCharacters(append = false) {
         } else {
             const tagIds = [...datacatActiveTagIds];
             const parsed = parseSortMode(datacatSortMode);
-            const useRecent = !parsed || tagIds.length > 0;
+            // Search and tags both force the offset endpoint (fresh has neither); keep this
+            // in lockstep with isFreshMode below and the fresh gate in advanceDatacatPage
+            const useRecent = !parsed || tagIds.length > 0 || !!datacatSearchQuery;
             if (useRecent) {
                 const data = await fetchRecentPublic({
                     limit: PAGE_SIZE,
                     offset: datacatCurrentOffset,
-                    tagIds: tagIds.length > 0 ? tagIds : undefined
+                    tagIds: tagIds.length > 0 ? tagIds : undefined,
+                    search: datacatSearchQuery || undefined,
+                    // recent-public honors only sortBy=score, so Score sorts survive tag/search
+                    // filtering; the other fresh sorts fall back to newest-first on this path
+                    sortBy: parsed?.sortBy === 'score' ? 'score' : undefined
                 });
                 list = data?.characters || [];
                 total = data?.totalCount || 0;
@@ -577,11 +544,29 @@ async function loadCharacters(append = false) {
         if (!delegatesInitialized) return;
 
         const freshParsed = parseSortMode(datacatSortMode);
-        const isFreshMode = datacatBrowseMode !== 'creator' && freshParsed && datacatActiveTagIds.size === 0;
+        const isFreshMode = datacatBrowseMode !== 'creator' && freshParsed && datacatActiveTagIds.size === 0 && !datacatSearchQuery;
         const isMeili = isJannySortMode(datacatSortMode);
         const isHampter = isHampterSortMode(datacatSortMode);
 
-        if (isMeili) {
+        // Creator mode fetches by offset regardless of any lingering browse sort, so it must route
+        // here first like the fetch branch above does (sort-keyed routing used to send creator
+        // appends through stale meili/hampter page math when such a sort was left selected)
+        const isOffsetMode = datacatBrowseMode === 'creator' || (!isMeili && !isHampter && !isFreshMode);
+
+        if (isOffsetMode) {
+            if (append) {
+                const existingIds = new Set(datacatCharacters.map(c => getCharId(c)));
+                datacatCharacters = datacatCharacters.concat(list.filter(c => {
+                    const id = getCharId(c);
+                    return !id || !existingIds.has(id);
+                }));
+            } else {
+                datacatCharacters = list;
+            }
+            // Advance by what actually arrived, not by PAGE_SIZE: the server clamps the limit
+            datacatCurrentOffset = (append ? datacatCurrentOffset : 0) + list.length;
+            datacatHasMore = datacatCurrentOffset < total;
+        } else if (isMeili) {
             if (append) {
                 const existingIds = new Set(datacatCharacters.map(c => getCharId(c)));
                 datacatCharacters = datacatCharacters.concat(list.filter(c => {
@@ -603,23 +588,16 @@ async function loadCharacters(append = false) {
                 datacatCharacters = list;
             }
             datacatHasMore = hampterCurrentPage < hampterTotalPages;
-        } else if (isFreshMode) {
+        } else {
+            // Fresh mode: the endpoint returns a cumulative top-N list, replace wholesale
             datacatCharacters = list;
             const activeLimit = freshParsed.window === '24h' ? datacatFreshLimit24 : datacatFreshLimitWeek;
             datacatHasMore = list.length >= activeLimit;
-        } else if (append) {
-            const existingIds = new Set(datacatCharacters.map(c => getCharId(c)));
-            datacatCharacters = datacatCharacters.concat(list.filter(c => {
-                const id = getCharId(c);
-                return !id || !existingIds.has(id);
-            }));
-            datacatHasMore = (datacatCurrentOffset + PAGE_SIZE) < total;
-        } else {
-            datacatCharacters = list;
-            datacatHasMore = (datacatCurrentOffset + PAGE_SIZE) < total;
         }
 
+        const renderedBefore = append ? datacatGridRenderedCount : 0;
         renderGrid(datacatCharacters, append);
+        visibleNew = datacatGridRenderedCount - renderedBefore;
 
         if (!append && datacatCharacters.length === 0) {
             const emptyMsg = datacatBrowseMode === 'creator'
@@ -639,10 +617,9 @@ async function loadCharacters(append = false) {
         if (thisToken !== datacatLoadToken) return;
         console.error('[DatacatBrowse] Load error:', err);
         const isHampterBlocked = err?.code === 'HAMPTER_BLOCKED' && isHampterSortMode(datacatSortMode);
-        const isFlareSolverrError = err?.code === 'FLARESOLVERR_ERROR' && isHampterSortMode(datacatSortMode);
         const isHampterLoginGated = err?.code === 'HAMPTER_LOGIN_REQUIRED' && isHampterSortMode(datacatSortMode);
         const isHampterTokenExpired = err?.code === 'HAMPTER_TOKEN_EXPIRED' && isHampterSortMode(datacatSortMode);
-        const isInlineNotice = isHampterBlocked || isFlareSolverrError || isHampterLoginGated || isHampterTokenExpired;
+        const isInlineNotice = isHampterBlocked || isHampterLoginGated || isHampterTokenExpired;
         if (!isInlineNotice) {
             showToast(`DataCat load failed: ${err.message}`, 'error');
         }
@@ -666,10 +643,10 @@ async function loadCharacters(append = false) {
             showToast('JanitorAI serves only the first page of this sort without a login. Add your JanitorAI token in Settings for more.', 'info', 7000);
             return;
         }
-        if ((isHampterBlocked || isFlareSolverrError) && append) {
-            // Transient Cloudflare block; roll the page back so the next Load More refetches it.
+        if (isHampterBlocked && append) {
+            // Cloudflare block; roll the page back so the next Load More refetches it.
             hampterCurrentPage = Math.max(1, hampterCurrentPage - 1);
-            showToast('JanitorAI blocked this page load. Hit Load More to retry.', 'warning', 6000);
+            showToast('Cloudflare blocked this page load. Install the companion userscript for reliable access to these sorts.', 'warning', 6000);
             return;
         }
         if (!append && grid) {
@@ -681,36 +658,19 @@ async function loadCharacters(append = false) {
                         <p style="margin-top: 12px; color: var(--text-primary);"><strong>${expired ? 'Your JanitorAI session expired' : 'JanitorAI requires an account for this request'}</strong></p>
                         <p style="margin-top: 8px;">${expired
                             ? 'JanitorAI tokens last about 3 hours. Re-copy the sb-auth-auth-token cookie and paste it under Settings &rarr; Online &rarr; DataCat.'
-                            : 'Trending and Popular show the first page without a login. Paste your JanitorAI token under Settings &rarr; Online &rarr; DataCat to browse further, or use the MeiliSearch sort orders, which need no login.'}</p>
+                            : 'The Hampter sorts show the first page without a login. Paste your JanitorAI token under Settings &rarr; Online &rarr; DataCat to browse further, or use the MeiliSearch sort orders, which need no login.'}</p>
                         <button class="glass-btn" style="margin-top: 12px;" id="datacatRetryBtn">
                             <i class="fa-solid fa-redo"></i> Retry
                         </button>
                     </div>
                 `;
             } else if (isHampterBlocked) {
-                const hasFlareUrl = !!(getSetting('datacatFlareSolverrUrl') || '').trim();
-                const flareHint = hasFlareUrl
-                    ? '<p style="margin-top: 8px;">Your configured FlareSolverr fallback also could not satisfy the challenge. Try restarting it, or check its logs.</p>'
-                    : '<p style="margin-top: 8px;">Retry usually clears a one-off block. If it persists, an optional <a href="https://github.com/FlareSolverr/FlareSolverr" target="_blank" rel="noopener noreferrer" style="color: var(--accent);">FlareSolverr</a> instance (Settings &rarr; Online &rarr; DataCat) can act as a fallback fetcher.</p>';
                 grid.innerHTML = `
                     <div style="grid-column: 1 / -1; padding: 40px; text-align: center; color: var(--text-muted); max-width: 560px; margin: 0 auto;">
                         <i class="fa-solid fa-shield-halved" style="font-size: 2rem; color: #f5a623;"></i>
-                        <p style="margin-top: 12px; color: var(--text-primary);"><strong>JanitorAI blocked this request</strong></p>
-                        <p style="margin-top: 8px;">Cloudflare rejected the fetch this time. These sort orders normally load directly in the browser without any setup.</p>
-                        <p style="margin-top: 8px;">The other JanitorAI sort orders (MeiliSearch) still work.</p>
-                        ${flareHint}
-                        <button class="glass-btn" style="margin-top: 12px;" id="datacatRetryBtn">
-                            <i class="fa-solid fa-redo"></i> Retry
-                        </button>
-                    </div>
-                `;
-            } else if (isFlareSolverrError) {
-                grid.innerHTML = `
-                    <div style="grid-column: 1 / -1; padding: 40px; text-align: center; color: var(--text-muted); max-width: 560px; margin: 0 auto;">
-                        <i class="fa-solid fa-fire" style="font-size: 2rem; color: var(--cl-error-bright);"></i>
-                        <p style="margin-top: 12px; color: var(--text-primary);"><strong>FlareSolverr error</strong></p>
-                        <p style="margin-top: 8px;">${escapeHtml(err.message)}</p>
-                        <p style="margin-top: 8px;">Verify your FlareSolverr URL under Settings &rarr; Online &rarr; DataCat, or check that the service is running.</p>
+                        <p style="margin-top: 12px; color: var(--text-primary);"><strong>Cloudflare blocked this request</strong></p>
+                        <p style="margin-top: 8px;">JanitorAI's Hampter sort orders sit behind Cloudflare, which blocked this load. Direct access is unreliable; the companion <strong>userscript</strong> makes it dependable. The other JanitorAI sort orders (MeiliSearch) always work.</p>
+                        <p style="margin-top: 12px;"><a href="#" id="datacatHampterHelpLink" style="color: var(--accent);">How to set up the userscript &rarr;</a></p>
                         <button class="glass-btn" style="margin-top: 12px;" id="datacatRetryBtn">
                             <i class="fa-solid fa-redo"></i> Retry
                         </button>
@@ -729,6 +689,10 @@ async function loadCharacters(append = false) {
             }
             const retryBtn = document.getElementById('datacatRetryBtn');
             if (retryBtn) retryBtn.addEventListener('click', () => loadCharacters(false));
+            document.getElementById('datacatHampterHelpLink')?.addEventListener('click', (e) => {
+                e.preventDefault();
+                openGalleryInfoModal('providers', 'helpDatacatHampter');
+            });
         }
     } finally {
         if (thisToken === datacatLoadToken) {
@@ -739,6 +703,22 @@ async function loadCharacters(append = false) {
             }
         }
     }
+
+    // Client-side filters (NSFW-off, hide-owned/possible/source, excludes) can shrink a raw page
+    // to a sliver, which reads as the infinite scroll stalling at the bottom. Chain fetches until
+    // a full page of VISIBLE cards has landed for this user action, capped like chub's loop.
+    if (Number.isFinite(visibleNew) && thisToken === datacatLoadToken && delegatesInitialized
+        && datacatViewMode === 'browse' && datacatHasMore
+        && (append || datacatCharacters.length > 0)) {
+        datacatTopUpVisible += visibleNew;
+        if (datacatTopUpVisible < PAGE_SIZE && datacatAutoTopUps < 3) {
+            datacatAutoTopUps++;
+            // Chained fetches bypass _triggerLoadMore, so drive the loading bar ourselves
+            // (the next render's updateLoadMore restores it to hidden/end)
+            datacatBrowseView._setScrollIndicator('loading');
+            advanceDatacatPage();
+        }
+    }
 }
 
 // ========================================
@@ -746,10 +726,16 @@ async function loadCharacters(append = false) {
 // ========================================
 
 async function loadFacetedTags() {
-    if (datacatTagsLoaded) return;
+    if (datacatTagsLoaded || datacatTagsLoading) return;
+    datacatTagsLoading = true;
+    const container = document.getElementById('datacatTagsList');
+    if (container) container.innerHTML = '<div class="browse-tags-loading"><i class="fa-solid fa-spinner fa-spin"></i> Loading tags...</div>';
     try {
         const data = await fetchFacetedTags({ activeTagIds: [...datacatActiveTagIds] });
-        if (!data) return;
+        if (!data) {
+            if (container) container.innerHTML = '<div class="browse-tags-empty">Failed to load tags</div>';
+            return;
+        }
         datacatTagGroups = data.groups || [];
         datacatTags = data.tags || [];
         datacatTagsLoaded = true;
@@ -757,6 +743,9 @@ async function loadFacetedTags() {
         debugLog('[DatacatBrowse] Faceted tags loaded:', datacatTagGroups.length, 'groups,', datacatTags.length, 'tags');
     } catch (e) {
         console.error('[DatacatBrowse] Failed to load faceted tags:', e);
+        if (container) container.innerHTML = '<div class="browse-tags-empty">Failed to load tags</div>';
+    } finally {
+        datacatTagsLoading = false;
     }
 }
 
@@ -788,66 +777,95 @@ function renderTagsList(filter = '') {
         return name.includes(filterLower) || slug.includes(filterLower);
     };
 
+    const buildRow = (tag) => {
+        const active = datacatActiveTagIds.has(tag.id);
+        const stateClass = active ? 'state-include' : 'state-neutral';
+        const stateIcon = active ? '<i class="fa-solid fa-plus"></i>' : '';
+        const stateTitle = active ? 'Active: click to remove' : 'Click to filter';
+        const countStr = tag.count != null ? ` (${formatNumber(tag.count)})` : '';
+        const cleanName = (tag.name || tag.slug || '').replace(/^[\p{Emoji_Presentation}\p{Emoji}\uFE0F\u200D]+\s*/u, '').trim() || tag.name;
+        return `
+            <div class="browse-tag-filter-item" data-tag-id="${tag.id}">
+                <button class="browse-tag-state-btn ${stateClass}" title="${stateTitle}">${stateIcon}</button>
+                <span class="tag-label">${escapeHtml(cleanName)}${countStr}</span>
+            </div>
+        `;
+    };
+
+    const groupIds = new Set(datacatTagGroups.map(g => g.id));
     const sortedGroups = [...datacatTagGroups].sort((a, b) => (a.display_order || 0) - (b.display_order || 0));
 
     let html = '';
-    let renderedAny = false;
     for (const group of sortedGroups) {
         const groupTags = datacatTags
             .filter(t => t.groupId === group.id && matchesFilter(t))
             .sort((a, b) => (b.count || 0) - (a.count || 0));
         if (groupTags.length === 0) continue;
-        renderedAny = true;
-
         html += `<div class="dropdown-section-title">${escapeHtml(group.name)}</div>`;
-        for (const tag of groupTags) {
-            const active = datacatActiveTagIds.has(tag.id);
-            const stateClass = active ? 'state-include' : 'state-neutral';
-            const stateIcon = active ? '<i class="fa-solid fa-plus"></i>' : '';
-            const stateTitle = active ? 'Active: click to remove' : 'Click to filter';
-            const countStr = tag.count != null ? ` (${formatNumber(tag.count)})` : '';
-            const cleanName = (tag.name || tag.slug || '').replace(/^[\p{Emoji_Presentation}\p{Emoji}\uFE0F\u200D]+\s*/u, '').trim() || tag.name;
-            html += `
-                <div class="browse-tag-filter-item" data-tag-id="${tag.id}">
-                    <button class="browse-tag-state-btn ${stateClass}" title="${stateTitle}">${stateIcon}</button>
-                    <span class="tag-label">${escapeHtml(cleanName)}${countStr}</span>
-                </div>
-            `;
-        }
+        html += groupTags.map(buildRow).join('');
     }
 
-    if (!renderedAny) {
+    // The catalog is ~76k tags and everything outside the curated groups is ungrouped, so the
+    // tail renders through the same chunked window the library tag popup uses: only a slice
+    // is in the DOM and scrolling near the bottom appends the next one. Active tags pin first.
+    const ungrouped = datacatTags
+        .filter(t => !groupIds.has(t.groupId) && matchesFilter(t))
+        .sort((a, b) => {
+            const aActive = datacatActiveTagIds.has(a.id) ? 0 : 1;
+            const bActive = datacatActiveTagIds.has(b.id) ? 0 : 1;
+            if (aActive !== bActive) return aActive - bActive;
+            return (b.count || 0) - (a.count || 0);
+        });
+
+    if (!html && ungrouped.length === 0) {
         container.innerHTML = '<div class="browse-tags-empty">No matching tags</div>';
         return;
     }
 
+    if (ungrouped.length > 0) {
+        html += '<div class="dropdown-section-title">All Tags</div>';
+    }
     container.innerHTML = html;
 
-    container.querySelectorAll('.browse-tag-filter-item').forEach(item => {
+    const CHUNK = 250;
+    let renderedCount = 0;
+    const appendChunk = () => {
+        const end = Math.min(renderedCount + CHUNK, ungrouped.length);
+        if (end <= renderedCount) return;
+        container.insertAdjacentHTML('beforeend', ungrouped.slice(renderedCount, end).map(buildRow).join(''));
+        renderedCount = end;
+    };
+    appendChunk();
+    container.onscroll = () => {
+        if (renderedCount >= ungrouped.length) return;
+        if (container.scrollTop + container.clientHeight >= container.scrollHeight - 200) appendChunk();
+    };
+
+    // Delegated so chunk appends dont re-bind and every row shares one handler
+    container.onclick = (e) => {
+        const item = e.target.closest('.browse-tag-filter-item');
+        if (!item || !container.contains(item)) return;
         const tagId = Number(item.dataset.tagId);
+        const tag = datacatTags.find(t => t.id === tagId);
+        const group = tag ? datacatTagGroups.find(g => g.id === tag.groupId) : null;
 
-        item.addEventListener('click', () => {
-            const tag = datacatTags.find(t => t.id === tagId);
-            const group = tag ? datacatTagGroups.find(g => g.id === tag.groupId) : null;
-
-            if (datacatActiveTagIds.has(tagId)) {
-                datacatActiveTagIds.delete(tagId);
-            } else {
-                if (group?.exclusive) {
-                    for (const otherTag of datacatTags.filter(t => t.groupId === group.id)) {
-                        datacatActiveTagIds.delete(otherTag.id);
-                    }
+        if (datacatActiveTagIds.has(tagId)) {
+            datacatActiveTagIds.delete(tagId);
+        } else {
+            if (group?.exclusive) {
+                for (const otherTag of datacatTags.filter(t => t.groupId === group.id)) {
+                    datacatActiveTagIds.delete(otherTag.id);
                 }
-                datacatActiveTagIds.add(tagId);
             }
+            datacatActiveTagIds.add(tagId);
+        }
 
-            cycleTagState(item.querySelector('.browse-tag-state-btn'), datacatActiveTagIds.has(tagId));
-            updateTagsButton();
-            datacatCurrentOffset = 0;
-            loadCharacters(false);
-            refreshTagCounts();
-        });
-    });
+        cycleTagState(item.querySelector('.browse-tag-state-btn'), datacatActiveTagIds.has(tagId));
+        updateTagsButton();
+        datacatCurrentOffset = 0;
+        loadCharacters(false);
+        refreshTagCounts();
+    };
 }
 
 function cycleTagState(btn, active) {
@@ -1008,8 +1026,11 @@ const JANNY_SORT_OPTIONS = [
 ];
 
 const HAMPTER_SORT_OPTIONS = [
+    { value: 'hampter_latest', label: '🆕 Latest' },
     { value: 'hampter_trending', label: '🔥 Trending' },
+    { value: 'hampter_trending24', label: '🔥 Trending (24h)' },
     { value: 'hampter_popular', label: '👑 Popular' },
+    { value: 'hampter_relevance', label: '🔍 Relevance' },
 ];
 
 function buildSortOptionsHtml(selected) {
@@ -1162,18 +1183,6 @@ function updateSearchPlaceholder() {
     input.placeholder = 'Search characters or paste a URL...';
 }
 
-function switchToMeiliSearch(query) {
-    datacatSortMode = 'janny_relevant';
-    const sortEl = document.getElementById('datacatSortSelect');
-    if (sortEl) sortEl.value = 'janny_relevant';
-    meiliSearchQuery = query;
-    meiliCurrentPage = 1;
-    datacatCurrentOffset = 0;
-    updateSearchPlaceholder();
-    updateTagsVisibility();
-    loadCharacters(false);
-}
-
 function doSearch() {
     const input = document.getElementById('datacatSearchInput');
     const val = (input?.value || '').trim();
@@ -1189,6 +1198,13 @@ function doSearch() {
         if (isHampterSortMode(datacatSortMode) && hampterSearchQuery) {
             hampterSearchQuery = '';
             hampterCurrentPage = 1;
+            loadCharacters(false);
+        }
+        // Clear native feed query if search is emptied
+        if (!isJannySortMode(datacatSortMode) && !isHampterSortMode(datacatSortMode)
+            && datacatSearchQuery) {
+            datacatSearchQuery = '';
+            datacatCurrentOffset = 0;
             loadCharacters(false);
         }
         return;
@@ -1253,11 +1269,28 @@ function doSearch() {
         return;
     }
 
-    // Text search from any other mode: switch to MeiliSearch relevance
-    switchToMeiliSearch(val);
+    // Native text search on the DataCat feed (covers character and creator names)
+    datacatSearchQuery = val;
+    datacatCurrentOffset = 0;
+    loadCharacters(false);
 }
 
-function performDatacatCreatorSearch() {
+// Resolve a creator name against the live feed: recent-public's search matches creator names
+// too (verified 2026-07-15), so this works with no cards loaded. Exact name match preferred.
+async function resolveCreatorFromFeed(name) {
+    try {
+        const data = await fetchRecentPublic({ limit: 50, offset: 0, search: name, minTotalTokens: 0 });
+        const rows = data?.characters || [];
+        const lower = name.toLowerCase();
+        return rows.find(c => getCreatorName(c).toLowerCase() === lower)
+            || rows.find(c => getCreatorName(c).toLowerCase().includes(lower))
+            || null;
+    } catch {
+        return null;
+    }
+}
+
+async function performDatacatCreatorSearch() {
     const input = document.getElementById('datacatCreatorSearchInput');
     const query = input?.value.trim();
     if (!query) {
@@ -1321,6 +1354,10 @@ function performDatacatCreatorSearch() {
 
     const partialFollowing = datacatFollowingCharacters.find(c => getCreatorName(c).toLowerCase().includes(lowerQuery));
     if (partialFollowing && routeFromHit(partialFollowing)) return;
+
+    // Server-side: the feed search covers creator names, so unloaded creators resolve too
+    const feedHit = await resolveCreatorFromFeed(query);
+    if (feedHit && routeFromHit(feedHit)) return;
 
     showToast('Creator not found. Try pasting a DataCat creator URL instead.', 'warning');
 }
@@ -2173,7 +2210,8 @@ function openPreviewModal(hit) {
 
     const charId = getCharId(hit);
     const name = hit.name || 'Unknown';
-    const avatarUrl = resolveDatacatAvatarUrl(hit) || '/img/ai4.png';
+    // Modal header renders ~150px; a thumbnail avoids decoding the full janitorai original on open
+    const avatarUrl = resolveDatacatAvatarUrl(hit, { width: 600 }) || '/img/ai4.png';
     const tags = resolveTagNames(hit.tags || []);
     const creatorName = getCreatorName(hit) || 'Unknown';
     const inLibrary = isCharInLocalLibrary(hit);
@@ -2185,9 +2223,13 @@ function openPreviewModal(hit) {
     const totalTokens = getTotalTokens(hit);
     const createdDate = getCreatedDate(hit) || 'Unknown';
 
-    // Header
+    // Header. Clear the previous card's painted image first: an img keeps showing its old
+    // content until the new src decodes, and slow hampter avatars make that stale for seconds.
     const avatarImg = document.getElementById('datacatCharAvatar');
+    if (avatarImg.getAttribute('src') !== avatarUrl) avatarImg.removeAttribute('src');
     avatarImg.src = avatarUrl;
+    // Full-res (no width param) for the avatar viewer; the square itself stays a thumbnail
+    avatarImg.dataset.full = resolveDatacatAvatarUrl(hit, { preferOriginal: true }) || avatarUrl;
     avatarImg.onerror = () => { avatarImg.src = '/img/ai4.png'; };
     BrowseView.adjustPortraitPosition(avatarImg);
     document.getElementById('datacatCharName').textContent = name;
@@ -2396,6 +2438,14 @@ async function fetchAndPopulateDetails(hit, token) {
         // Store full data on the selected char for import
         if (datacatSelectedChar && getCharId(datacatSelectedChar) === charId) {
             datacatSelectedChar._fullCharacter = character;
+        }
+
+        // The listing row only knew the 640px card variant; upgrade the avatar viewer to the
+        // true original now that the detail payload is here.
+        const detailAvatarImg = document.getElementById('datacatCharAvatar');
+        if (detailAvatarImg) {
+            const fullRes = resolveDatacatAvatarUrl(character, { preferOriginal: true });
+            if (fullRes) detailAvatarImg.dataset.full = fullRes;
         }
 
         // Update creator name if available (MeiliSearch hits lack it)
@@ -3084,26 +3134,19 @@ function initDatacatView() {
             datacatCurrentOffset = 0;
             loadCharacters(false);
         }
+        if (!isJannySortMode(datacatSortMode) && !isHampterSortMode(datacatSortMode)
+            && datacatSearchQuery) {
+            datacatSearchQuery = '';
+            datacatCurrentOffset = 0;
+            loadCharacters(false);
+        }
     });
 
     // Load More
     on('datacatLoadMoreBtn', 'click', () => {
-        if (datacatBrowseMode === 'creator') {
-            datacatCurrentOffset += PAGE_SIZE;
-        } else if (isHampterSortMode(datacatSortMode)) {
-            hampterCurrentPage++;
-        } else if (isJannySortMode(datacatSortMode)) {
-            meiliCurrentPage++;
-        } else {
-            const loadParsed = parseSortMode(datacatSortMode);
-            if (loadParsed) {
-                if (loadParsed.window === '24h') datacatFreshLimit24 += FRESH_PAGE_INCREMENT;
-                else datacatFreshLimitWeek += FRESH_PAGE_INCREMENT;
-            } else {
-                datacatCurrentOffset += PAGE_SIZE;
-            }
-        }
-        loadCharacters(true);
+        datacatAutoTopUps = 0;
+        datacatTopUpVisible = 0;
+        advanceDatacatPage();
     });
 
     on('datacatFollowingLoadMoreBtn', 'click', () => {
@@ -3228,6 +3271,11 @@ function initDatacatView() {
             if (searchInput) searchInput.value = '';
             if (isJannyTagMode()) {
                 renderJannyTagsList();
+            } else if (datacatTagsLoaded) {
+                // Re-render on every open: the search box was just cleared, and a stale DOM
+                // from the last filtered render would otherwise linger (this is also what
+                // surfaces active-tag pinning after toggles)
+                renderTagsList('');
             } else {
                 loadFacetedTags();
             }
@@ -3356,7 +3404,7 @@ function ensureModalEventsAttached() {
             if (isMobileMode()) return;
             e.stopPropagation();
             if (!avatar.src || avatar.src.endsWith('/img/ai4.png')) return;
-            BrowseView.openAvatarViewer(avatar.src);
+            BrowseView.openAvatarViewer(avatar.dataset.full || avatar.src, avatar.src);
         });
     }
 
@@ -3393,17 +3441,6 @@ window.openDatacatCharPreview = function(char) {
 // ========================================
 // BROWSE VIEW CLASS
 // ========================================
-
-// Destroy any active FlareSolverr session on tab close so we don't leak a
-// Chromium instance on the user's FlareSolverr server.
-if (typeof window !== 'undefined') {
-    window.addEventListener('beforeunload', () => {
-        if (flareSession.url && flareSession.id) {
-            // Use sendBeacon-friendly synchronous path is unavailable; best-effort.
-            destroyFlareSolverrSession(flareSession.url, flareSession.id);
-        }
-    });
-}
 
 const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
 
@@ -3517,6 +3554,22 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
         if (match && match.id && !isCreatorFollowed(match.id, match.source)) {
             followCreator(match.id, match.name, match.source);
             return { id: match.id, name: match.name };
+        }
+
+        // Server-side: the feed search covers creator names, so unloaded creators resolve too
+        const feedHit = await resolveCreatorFromFeed(raw);
+        if (feedHit) {
+            const id = getCreatorId(feedHit);
+            if (id) {
+                const name = getCreatorName(feedHit);
+                const source = getSourceKind(feedHit) === 'saucepan' ? 'saucepan' : 'datacat';
+                if (isCreatorFollowed(id, source)) {
+                    showToast('Already following this creator', 'info');
+                    return null;
+                }
+                followCreator(id, name, source);
+                return { id, name };
+            }
         }
 
         showToast('Creator not found. Try pasting a DataCat or Saucepan creator URL.', 'warning');
@@ -3762,7 +3815,7 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
         <div class="modal-glass browse-char-modal">
             <div class="modal-header">
                 <div class="browse-char-header-info">
-                    <img id="datacatCharAvatar" src="/img/ai4.png" alt="" class="browse-char-avatar">
+                    <img id="datacatCharAvatar" src="/img/ai4.png" alt="" class="browse-char-avatar" decoding="async">
                     <div>
                         <h2 id="datacatCharName">Character Name</h2>
                         <p class="browse-char-meta">
@@ -3908,22 +3961,9 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
             renderFollowing(true);
             return;
         }
-        if (datacatBrowseMode === 'creator') {
-            datacatCurrentOffset += PAGE_SIZE;
-        } else if (isHampterSortMode(datacatSortMode)) {
-            hampterCurrentPage++;
-        } else if (isJannySortMode(datacatSortMode)) {
-            meiliCurrentPage++;
-        } else {
-            const parsed = parseSortMode(datacatSortMode);
-            if (parsed) {
-                if (parsed.window === '24h') datacatFreshLimit24 += FRESH_PAGE_INCREMENT;
-                else datacatFreshLimitWeek += FRESH_PAGE_INCREMENT;
-            } else {
-                datacatCurrentOffset += PAGE_SIZE;
-            }
-        }
-        loadCharacters(true);
+        datacatAutoTopUps = 0;
+        datacatTopUpVisible = 0;
+        return advanceDatacatPage();
     }
 
     init() {
@@ -4014,6 +4054,7 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
             datacatSelectedChar = null;
             datacatCharacters = [];
             datacatCurrentOffset = 0;
+            datacatSearchQuery = '';
             datacatFreshLimit24 = 80;
             datacatFreshLimitWeek = 20;
             datacatHasMore = true;
@@ -4030,6 +4071,10 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
         }
         const wasInitialized = this._initialized;
         super.activate(container, options);
+
+        // Eager background load so the tag picker is ready before its first open
+        // (guarded internally, so re-entries are free)
+        loadFacetedTags();
 
         if (wasInitialized && this._initialized) {
             delegatesInitialized = true;
@@ -4056,10 +4101,6 @@ const datacatBrowseView = new (class DatacatBrowseView extends BrowseView {
         datacatDetailFetchToken++;
         delegatesInitialized = false;
         clearExtractionState();
-        // Intentionally NOT clearing the FlareSolverr session here - keeping
-        // it alive across tab switches means re-entering DataCat reuses the
-        // already-warm session instead of paying the CF challenge cost again.
-        // The session is destroyed on page unload via the beforeunload hook.
         super.deactivate();
         this.disconnectImageObserver();
     }

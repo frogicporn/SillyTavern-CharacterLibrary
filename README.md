@@ -56,17 +56,20 @@ A powerful SillyTavern extension for discovering, organizing, and managing your 
 - **Grid view** with virtual-scroll and progressive lazy-loading
 - **Search** across name, tags, author, and creator's notes, plus [special search filters](#search-filters)
 - **Tag filtering** with include/exclude/neutral tri-state logic
-- **Sort** by name, last modified, or date created
+- **Sort** by name, last modified, date created, token count, or random
 - **Favorites** filter, with SillyTavern native favorites sync
 - **Card updates** from any linked provider with field-level diffs (single or batch)
 - **Batch tagging** to add or remove tags across multiple characters at once
 - **Multi-select** for batch tagging, favorites, update checks, export, or deletion
+- **Bundle export/import** to move characters between SillyTavern instances in one .zip: cards, chats, gallery folders, and linked lorebooks. Export via multi-select; import by drag & drop into the import dialog
 - **Right-click context menu** on any character card for quick actions
 - **Version history & snapshots** with save/restore, remote version browsing, and full diff preview
 - **Playlists** for organizing characters into named, ordered virtual folders with icons and colors
 - **Filter presets** to save and restore your current filter configuration (tags, sort, search, advanced filters). Open the **Presets** dropdown in the Advanced Filters panel to load, save, rename, or delete presets. Type a name in the input to save the current filter state; click an existing preset to load it. Presets are also available in the **Chats** tab for filtering chat history.
 - **Default Filter Preset** in Settings to auto-apply one preset every time the library opens, so you land in your most-used view without re-applying filters.
 - **Character Creator** with built-in AI Studio for assisted card authoring, brainstorming, and iterative refinement
+- **Lorebook Manager** for browsing, editing, creating, importing, and exporting world files, with AI-assisted entry generation
+- **Custom CSS theming** with snippet management and an AI CSS Assistant that writes and iterates on styling for you
 - **Animated card info** on hover with configurable visibility options
 
 ### 🎨 Character Details
@@ -115,7 +118,7 @@ These options apply when Embedded Panel mode is selected:
 |---------|---------|-------------|
 | **Launch on startup** | Off | Automatically open the embedded panel when SillyTavern loads. |
 | **Show SillyTavern top bar** | On | Keep SillyTavern's top navigation bar visible above the panel. When off, the panel takes the full viewport height. A "Back" button inside the panel returns you to your chat. |
-| **Exclusive panels** | Off | When enabled, opening the embedded panel closes any open SillyTavern drawers, and opening an ST drawer closes the panel. Prevents panels from overlapping. |
+| **Exclusive panels** | On | When enabled, opening the embedded panel closes any open SillyTavern drawers, and opening an ST drawer closes the panel. Prevents panels from overlapping. |
 
 ---
 
@@ -126,7 +129,7 @@ These options apply when Embedded Panel mode is selected:
 
 - **Gallery tab** for all character images, video, and audio in one place
 - **Embedded media downloads** for images linked in creator notes, descriptions, and greetings
-- **External image-host extractors** for content embedded as gallery/album links (not direct image URLs). Supports Civitai, Imgchest, Mega, Imgur, PostImg, Imgbox, ImgBB, Catbox, Dropbox, and Google Drive. The library walks each link, resolves the actual image URLs, and downloads them into the gallery folder
+- **External image-host extractors** for content embedded as gallery/album links (not direct image URLs). Supports Civitai, Imgchest, Mega, Pixiv, PostImg, Imgbox, ImgBB, Catbox, Dropbox, and Google Drive. The library walks each link, resolves the actual image URLs, and downloads them into the gallery folder. Pixiv and Dropbox require the [cl-helper plugin](#cl-helper-plugin-not-detected); the rest work without it
 - **Provider gallery downloads** from linked characters on ChubAI, Wyvern, or Pygmalion
 - **Audio & video support** including MP3, WAV, OGG, M4A with built-in player; video thumbnails with inline playback
 - **Full-screen viewer** with keyboard navigation (← → 0 Esc) and scroll-wheel zoom up to 5× with drag-to-pan
@@ -135,7 +138,7 @@ These options apply when Embedded Panel mode is selected:
 - **Background media downloads** (opt-in): set **When an import has extra media** to **Download in the background** (**Settings → Media → Options**) and imports finish immediately while embedded media and gallery downloads run quietly, one character at a time, in a background queue. Track progress in the **notifications bell** in the topbar (**⋮ menu → Notifications** on mobile): live per-character progress, cancel, retry for failed jobs, and a clear-finished button. The queue survives page reloads and resumes automatically
 - **Grid card thumbnails** (opt-in) to cut decode cost and bandwidth on the characters grid. Enable in **Settings → Character Library → Grid Card Thumbnails**. By default thumbnails are served in the mobile layout only; toggle "Also use on desktop" to extend coverage. With the [cl-helper plugin](#cl-helper-plugin-not-detected) installed, cl-helper resizes via jimp and caches each thumbnail on disk at a configurable size (384 / 512 / 640 / 768px wide). Without cl-helper, ST's built-in `/thumbnail` endpoint is used (fixed 96x144, can look blurry on high-DPR screens). Two cache management buttons: **Populate at current size** pre-generates a thumbnail for every character (skipping already-cached) and **Purge cache** deletes every cached thumbnail. The detail modal and gallery always use the full-resolution image
 
-> **Civitai API key** (optional): Required only for private or hidden Civitai posts. Public content extracts without a key. Configure in **Settings → Online → Civitai API Key**. Generate one at [civitai.com/user/account](https://civitai.com/user/account).
+> **Civitai API key** (optional): Required only for private or hidden Civitai posts. Public content extracts without a key. Configure in **Settings → Online → Civitai API Key**. Generate one at [civitai.com/user/account](https://civitai.com/user/account). Using a key requires the [cl-helper plugin](#cl-helper-plugin-not-detected) (it attaches the key server-side); keyless public extraction works without it.
 
 > **Imgchest password-protected posts**: Card creators usually paste the password somewhere in the card text (creator's notes). The extractor scans these with a regex (matching common patterns like `password: ...`, `pw=...`, `pass is ...`) and submits it automatically. Authentication runs through the [cl-helper plugin](#cl-helper-plugin-not-detected); without cl-helper, only public posts are extractable.
 
@@ -327,7 +330,7 @@ If the pool is larger than your configured Sample Size, characters are randomly 
 
 #### LLM Context
 
-Controls which card metadata fields are included when sending characters to the LLM. Toggle any combination of: tags, creator notes, tagline, creator name, and source provider. A live token estimate updates as you change these, helping you stay within model context limits.
+Controls which card metadata fields are included when sending characters to the LLM. Toggle any combination of: tags, creator notes, tagline, creator name, source provider, and description (opt-in, off by default). A live token estimate updates as you change these, helping you stay within model context limits.
 
 #### API Modes
 
@@ -342,7 +345,7 @@ Controls which card metadata fields are included when sending characters to the 
 | Batches | Parallel batch count in Batch Mode (3-7) |
 | Temperature | LLM sampling temperature (Custom API only, ST mode uses your preset) |
 | Max Results | Maximum recommendations to return |
-| LLM Context | Toggle which metadata fields to include (tags, creator notes, tagline, creator, source) with live token estimate |
+| LLM Context | Toggle which metadata fields to include (tags, creator notes, tagline, creator, source, opt-in description) with live token estimate |
 
 Access via the **⋮ menu** → **Card Recommender**.
 
@@ -360,9 +363,48 @@ Access via the **⋮ menu** → **Card Recommender**.
 - **Browse all conversations** across all characters
 - **Sort by** date, character name, message count, chat length, or most active character
 - **Group by character** or view flat list
+- **Card density presets** (Spacious / Comfortable / Compact / Minimal) to control how much detail each chat card shows
 - **AI model badges** showing which model was used for each conversation
 - **Message previews** before opening
 - **Jump into any chat** without returning to SillyTavern
+
+</details>
+
+<details>
+<summary><h3>📦 Bundle Export / Import</h3></summary>
+
+Move characters between SillyTavern instances with everything attached, not just the card PNG.
+
+- **Export** via multi-select: pick characters, hit Export, and choose between three modes: a **full bundle** (.zip with cards, all chats, and gallery folders), **character cards** (each card as a separate PNG), or **provider links** (copy the source URLs of linked characters to the clipboard)
+- **Include linked lorebooks** toggle adds each character's linked world files to the full bundle
+- **Import** by dragging the bundle .zip into the import dialog on the target instance. Cards, chats, gallery folders, and lorebooks are restored, along with metadata that a plain PNG import loses (favorite status, creation date, active chat)
+- A progress log reports exactly what was exported or restored, with per-item warnings on failures
+
+</details>
+
+<details>
+<summary><h3>📖 Lorebook Manager</h3></summary>
+
+A full manager for SillyTavern world files, opened from **More Options (⋮) → Lorebooks**.
+
+- **Browse all lorebooks** with entry counts and a "used by" view showing which characters link each file (primary links) and which chats have it chat-bound
+- **Create, import (.json), duplicate, export, and delete** world files
+- **Edit entries** inline: keywords, content, insertion settings, per-entry enable/disable
+- **AI entry generation**: describe what you want and let the LLM draft lorebook entries
+- **Link lorebooks to characters** from the manager or from the character detail modal's Linked Lorebook box, with a playlist filter for bulk linking. This covers the character's primary lorebook; *additional* lorebooks (ST's charLore) are not manageable from here, as they live in SillyTavern's settings with no clean external access
+- **Bind lorebooks to chats** (chat lore) from the manager or directly from a chat card in the Chats view; group chats are read-only
+
+</details>
+
+<details>
+<summary><h3>🎨 Custom CSS & AI Assistant</h3></summary>
+
+Theme or tweak the UI with your own CSS, managed as snippets. Open from **Settings → Theme & Layout → Open Custom CSS Editor**.
+
+- **Snippets** can be individually enabled, disabled, renamed, reordered, and deleted; styles persist across reloads
+- **AI CSS Assistant**: every snippet row has a wand button that opens a chat-style assistant. Describe the look you want ("dim the card grid", "make the accent purple") and it writes the CSS; iterate with follow-ups and save the result as a new snippet or update the one you started from
+- The assistant knows the app's component classes and theme tokens, so its snippets target the real UI instead of guessing selectors
+- Class names may change between versions, so treat custom CSS as power-user territory
 
 </details>
 
@@ -436,6 +478,7 @@ All providers share a common set of capabilities:
 - **Character linking** to link local characters to their online source for updates
 - **Bulk link scanner** to automatically scan your library and match unlinked characters
 - **Auto-link on import** for characters imported from any provider
+- **Per-provider browse defaults** in Settings → Online: pick the default view mode, sort order, and Hide Owned / Hide Possible states each provider starts with
 
 Providers with Following support include a **Followed Creators Manager** panel for browsing, searching, adding, and removing followed creators directly from the Following tab.
 
@@ -446,7 +489,7 @@ Providers with Following support include a **Followed Creators Manager** panel f
 | Browse & Search | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Card Updates | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Character Linking | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Gallery Downloads | ✅ | -- | -- | ✅ | ✅ | -- | ✅ |
+| Gallery Downloads | ✅ | -- | -- | ✅ | ✅ | ✅ | ✅ |
 | Remote Version History | ✅ | -- | -- | -- | -- | -- | -- |
 | Following / Timeline | ✅ | -- | -- | ✅ | ✅ | ✅ | ✅ |
 | Favorites | ✅ | -- | -- | -- | -- | -- | ✅ |
@@ -580,7 +623,7 @@ DataCat aggregates JanitorAI characters with its own REST API and AI-powered cha
 
 - Browse recent and popular characters
 - Sort by newest, trending, popular, and Hampter algorithm modes
-- Hampter sort orders (Trending, Popular) now require an optional [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) endpoint configured in Settings > Online > DataCat (proxied through the [cl-helper plugin](#cl-helper-plugin-not-detected)), since JanitorAI's trending/popular feed is now behind Cloudflare bot protection (other sort orders work without it)
+- Hampter sort orders (Latest, Trending, Trending 24h, Popular, Relevance) sit behind Cloudflare bot protection. A direct browser load is hit-or-miss (Cloudflare usually blocks it), so the companion **userscript** (`extras/cl-janitor-bridge.user.js`, installed in Tampermonkey or Violentmonkey) is the reliable path; it makes the Cloudflare-gated request from your own browser. JanitorAI serves only the first page of these sorts anonymously; paste your JanitorAI `sb-auth-auth-token` cookie under Settings > Online > DataCat to page further (the session then refreshes itself). Other DataCat and MeiliSearch sort orders need neither
 - Filter by tags and NSFW toggle
 - In-app character preview with card details
 - Character linking and card updates
@@ -606,6 +649,7 @@ Extraction is handled entirely by DataCat's servers. The `appearOnPublicFeed` op
 1. Ensure the [cl-helper plugin](#cl-helper-plugin-not-detected) is installed and detected (required for session proxying)
 2. Enable DataCat in Settings > Online > Providers
 3. The session initializes automatically on first browse
+4. (Optional, for the JanitorAI Hampter sorts) Install the companion userscript `extras/cl-janitor-bridge.user.js` in a userscript manager like Tampermonkey or Violentmonkey, and add your JanitorAI login in Settings > Online > DataCat to page past the first page
 
 </details>
 
@@ -666,17 +710,17 @@ Type these prefixes in the search bar for targeted filtering:
 
 | Filter | Example | Description |
 |--------|---------|-------------|
-| `creator:` | `creator:AuthorName` | Exact creator/author match |
-| `fav:` | `fav:yes` or `fav:no` | Filter by favorites status |
+| `creator:` | `creator:AuthorName` | Creator/author contains match (case-insensitive) |
+| `fav:` | `fav:yes` or `fav:no` | Filter by favorites status (also `favorite:`) |
 | `linked:` | `linked:yes` or `linked:no` | Any provider link |
 | `chub:` | `chub:yes` or `chub:no` | ChubAI link specifically |
 | `janny:` | `janny:yes` or `janny:no` | JanitorAI link specifically |
-| `ct:` | `ct:yes` or `ct:no` | CharacterTavern link specifically |
+| `ct:` | `ct:yes` or `ct:no` | CharacterTavern link specifically (also `charactertavern:`) |
 | `pygmalion:` | `pygmalion:yes` or `pygmalion:no` | Pygmalion link specifically |
 | `wyvern:` | `wyvern:yes` or `wyvern:no` | Wyvern link specifically |
 | `datacat:` | `datacat:yes` or `datacat:no` | DataCat link specifically (also `dc:`) |
 | `botbooru:` | `botbooru:yes` or `botbooru:no` | Botbooru link specifically (also `bb:`) |
-| `version:` | `version:1.0` | Match character version string |
+| `version:` | `version:1.0` or `version:none` | Match character version string (or `none` for unversioned) |
 | `gallery:` | `gallery:aB3x` or `gallery:none` | Match gallery ID (or `none` for unassigned) |
 | `uid:` | `uid:abc123` or `uid:none` | Match version UID (or `none` for unassigned) |
 | `playlist:` | `playlist:backlog` or `playlist:none` | Match playlist name (or `none`/`any` for membership) |
@@ -726,7 +770,7 @@ The full app is optimized for mobile with:
 
 ### cl-helper plugin not detected
 
-The **cl-helper** plugin is required for Pygmalion login, CharacterTavern NSFW access, and DataCat session proxying. It ships with Character Library in the `extras/cl-helper/` folder but needs to be placed in SillyTavern's plugins directory:
+The **cl-helper** plugin is required for Pygmalion login, Botbooru login, CharacterTavern NSFW access, DataCat session proxying, the Pixiv and Dropbox gallery extractors, Imgchest password-protected posts, Civitai API-key requests, and the disk-cached avatar/gallery thumbnails. It ships with Character Library in the `extras/cl-helper/` folder but needs to be placed in SillyTavern's plugins directory:
 
 1. Copy (or symlink) the `extras/cl-helper` folder into your SillyTavern **plugins** directory:
    ```
@@ -739,7 +783,7 @@ The **cl-helper** plugin is required for Pygmalion login, CharacterTavern NSFW a
 3. **Restart SillyTavern** (plugins only load at startup)
 4. Verify in the login/auth modal (appears when enabling NSFW). You should see "cl-helper plugin detected"
 
-> The plugin runs server-side to handle auth flows that browsers can't do directly (e.g. Origin headers for Pygmalion, cookie proxying for CharacterTavern, session token management for DataCat). It only communicates with the specific provider APIs and only forwards GET requests through its read-only proxies. See the [plugin source](extras/cl-helper/index.js) for details.
+> The plugin runs server-side to handle auth flows that browsers can't do directly (e.g. Origin headers for Pygmalion, cookie proxying for CharacterTavern, session token management for DataCat). It only communicates with the specific provider APIs through hostname-pinned, path-allowlisted proxies; most are read-only GET proxies, plus a handful of dedicated POST routes for login handshakes and extraction. See the [plugin source](extras/cl-helper/index.js) for details.
 
 ### Media downloads fail with CORS errors
 
@@ -751,6 +795,16 @@ Some image hosts (Imgur, Catbox, etc.) block direct browser requests due to CORS
 4. Retry the download in Character Library
 
 This affects embedded media downloads, provider gallery downloads, and bulk localization.
+
+### JanitorAI Hampter sorts say "Cloudflare blocked this request"
+
+JanitorAI's Hampter sort orders (Latest, Trending, and the rest, on the DataCat provider) sit behind Cloudflare bot protection. A direct load usually gets blocked (it occasionally slips through, but you can't rely on it). Install the companion userscript for dependable access:
+
+1. Install a userscript manager (Tampermonkey or Violentmonkey)
+2. Add `extras/cl-janitor-bridge.user.js` from this repository
+3. Reload the Character Library tab and retry the sort
+
+The userscript makes the Cloudflare-gated request from your own browser and hands only the results to Character Library. Without it these sorts are unreliable (Cloudflare usually blocks the direct fetch, though it occasionally gets through); every other DataCat and JanitorAI sort order works without it. To page past the first page, also add your JanitorAI login under Settings > Online > DataCat. Tested on desktop; on mobile, a userscript-capable browser such as Firefox for Android, or a mobile-specific solution that routes the request through a webview, works too.
 
 ### Characters load more slowly behind HTTP Basic auth
 

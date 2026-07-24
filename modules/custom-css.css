@@ -291,7 +291,6 @@
 }
 /* Drawer-only elements are mobile-only. Hidden on desktop. */
 .ccss-drawer-trigger,
-.ccss-drawer-close,
 .ccss-drawer-title,
 .ccss-drawer-scrim,
 .ccss-sidebar .mobile-sheet-handle { display: none; }
@@ -504,6 +503,7 @@ html.cl-mobile .ccss-sidebar .mobile-sheet-handle {
     display: block;
     width: 40px;
     height: 4px;
+    flex-shrink: 0;
     background: var(--text-faint);
     opacity: 0.4;
     border-radius: var(--radius-2xs);
@@ -515,7 +515,7 @@ html.cl-mobile .ccss-snippet-list {
     overflow: visible;
 }
 
-/* Sheet header: title on the left, close on the right, New button on its own row */
+/* Sheet header: title row, New button on its own full-width row */
 html.cl-mobile .ccss-sidebar-header {
     flex-direction: row !important;
     flex-wrap: wrap;
@@ -529,20 +529,6 @@ html.cl-mobile .ccss-drawer-title {
     font-weight: 600;
     color: var(--text-primary);
 }
-html.cl-mobile .ccss-drawer-close {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    background: none;
-    border: none;
-    color: var(--text-secondary);
-    cursor: pointer;
-    min-width: var(--touch-target-min);
-    min-height: var(--touch-target-min);
-    font-size: var(--font-lg);
-    border-radius: var(--radius-sm);
-}
-html.cl-mobile .ccss-drawer-close:hover { color: var(--text-primary); background: rgba(255,255,255,0.05); }
 html.cl-mobile .ccss-sidebar-new {
     flex-basis: 100%;
     order: 99;

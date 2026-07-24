@@ -280,7 +280,6 @@ Loaders & progress (CL does NOT use native <progress> elements):
                            .cl-loading .cl-loading-icon          Wrapper for the rotating icon (sized 48x48).
                            .cl-loading .cl-loading-icon i        The FontAwesome icon itself. Has color: var(--accent) and a drop-shadow filter derived from --accent. Recolor: ".cl-loading .cl-loading-icon i { color: <color>; filter: drop-shadow(0 0 10px ...); }".
                            .cl-loading .cl-loading-label         Main status text.
-                           .cl-loading .cl-loading-substatus     Secondary status text.
                            .cl-loading .cl-loading-bar > span    Animated indeterminate progress bar inside the loader.
                          CSS border-rotation tricks (border-top-color on .cl-loading) do NOT produce a spinner: the rotation is on the FontAwesome icon, not the container.
   .cl-spinner-inline > i   Inline spinner used in grid/list slots. The <i> child is the rotating FontAwesome icon (uses fa-spin). To recolor: ".cl-spinner-inline i { color: <color>; }".

@@ -1093,15 +1093,6 @@ body {
     letter-spacing: 0.2px;
 }
 
-.cl-loading .cl-loading-substatus {
-    font-size: var(--font-sm);
-    color: var(--text-muted);
-    max-width: 380px;
-    text-align: center;
-    line-height: 1.4;
-    margin-top: calc(var(--space-2xs) * -1);
-}
-
 .cl-loading .cl-loading-bar {
     width: 160px;
     height: 2px;

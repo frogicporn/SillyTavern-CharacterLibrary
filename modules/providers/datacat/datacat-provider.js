@@ -8,6 +8,8 @@ import { ProviderBase } from '../provider-interface.js';
 import CoreAPI from '../../core-api.js';
 import { assignGalleryId, importFromPng, fetchWithProxy } from '../provider-utils.js';
 import datacatBrowseView from './datacat-browse.js';
+import { initJanitorBridge } from './janitor-bridge.js';
+import './datacat-avatar-restore.js';
 import {
     DATACAT_API_BASE,
     resolveDatacatAvatarUrl,
@@ -85,6 +87,8 @@ class DatacatProvider extends ProviderBase {
         api = coreAPI;
         setApiRequest(coreAPI.apiRequest);
         setSavedTokenGetter(() => coreAPI.getSetting('datacatToken') || null);
+        // Listen for the optional JanitorAI userscript bridge (passive, free when absent)
+        initJanitorBridge();
     }
 
     // ── View ────────────────────────────────────────────────
@@ -525,8 +529,14 @@ class DatacatProvider extends ProviderBase {
 
             assignGalleryId(characterCard, options, api);
 
-            // Download avatar
-            const avatarUrl = resolveDatacatAvatarUrl(character);
+            // Download avatar. Listing rows top out at datacat's resized variants (640 card /
+            // 768 hero); only the detail payload's embedded V2 json points at the untouched
+            // original, so upgrade before resolving (this also improves the saucepan portrait
+            // check below). Best-effort: keep the row on failure.
+            if (!character.chara_card_v2_json && !character.content_variants) {
+                character = await fetchDatacatCharacter(charId, sourceKind) || character;
+            }
+            const avatarUrl = resolveDatacatAvatarUrl(character, { preferOriginal: true });
             let imageBuffer = null;
 
             if (avatarUrl) {
