@@ -1623,6 +1623,11 @@ const SAUCEPAN_ALLOWED_PATHS = [
     /^\/api\/v1\/fandoms$/,
     /^\/api\/v1\/companions-of-user$/,
     /^\/api\/v2\/companions\/[a-zA-Z0-9-]+$/,
+    // Lorebooks: the companion route lists a card's books (metadata only), the
+    // by-id route carries the chapter text. Unlike definitions these are plain
+    // text — no fragment obfuscation — and carry their own read gate.
+    /^\/api\/v1\/companions\/[a-zA-Z0-9-]+\/lorebooks$/,
+    /^\/api\/v1\/lorebooks\/[a-zA-Z0-9-]+$/,
     /^\/cdn\/.+$/,
 ];
 const SAUCEPAN_POST_PATH = '/api/v1/search';
@@ -1725,6 +1730,10 @@ function sanitizeSaucepanSearchBody(input) {
         asc: asBool(input.asc),
         posted_at_from: asStringOrNull(input.posted_at_from, SAUCEPAN_MAX_DATE_LEN),
         posted_at_to: asStringOrNull(input.posted_at_to, SAUCEPAN_MAX_DATE_LEN),
+        min_portrait_count: asInt(input.min_portrait_count, 0, 100) ?? 0,
+        min_group_count: asInt(input.min_group_count, 0, 100) ?? 0,
+        min_lorebook_count: asInt(input.min_lorebook_count, 0, 100) ?? 0,
+        min_scenario_count: asInt(input.min_scenario_count, 0, 100) ?? 0,
         hide_hidden_content: asBool(input.hide_hidden_content),
         open_definition_only: asBool(input.open_definition_only),
     };

@@ -16,6 +16,8 @@ import {
     hasSaucepanToken,
     resolveSaucepanImageUrl,
     fetchSaucepanCompanion,
+    fetchSaucepanLorebook,
+    attachSaucepanLorebook,
     submitSaucepanExtraction,
     buildV2FromSaucepan,
     hitFromCompanion,
@@ -199,7 +201,7 @@ class SaucepanProvider extends ProviderBase {
                 api?.debugLog?.('[SaucepanProvider] native extraction failed:', extractResult.error);
                 return null;
             }
-            const result = buildV2FromSaucepan(hit, extractResult);
+            const result = await attachSaucepanLorebook(buildV2FromSaucepan(hit, extractResult), linkInfo.id);
             if (result) result._listingName = this.getListingName(hit);
             return result;
         } catch (e) {
@@ -214,6 +216,11 @@ class SaucepanProvider extends ProviderBase {
 
     getComparableFields() { return []; }
     get supportsVersionHistory() { return false; }
+
+    async fetchLorebook(linkInfo) {
+        if (!linkInfo?.id) return null;
+        return fetchSaucepanLorebook(linkInfo.id);
+    }
 
     // ── Gallery ──────────────────────────────────────────────
 
@@ -372,7 +379,7 @@ class SaucepanProvider extends ProviderBase {
             if (!extractResult.success) {
                 throw new Error(extractResult.error || 'Saucepan extraction failed');
             }
-            const characterCard = buildV2FromSaucepan(hit, extractResult);
+            const characterCard = await attachSaucepanLorebook(buildV2FromSaucepan(hit, extractResult), charId);
             if (!characterCard?.data) throw new Error('Failed to build character card (empty definition)');
 
             const characterName = characterCard.data.name || hit.name || 'Unnamed';

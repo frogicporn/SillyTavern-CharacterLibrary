@@ -89,6 +89,7 @@ let saucepanOpenDefinitionOnly = true;
 let saucepanActiveTags = new Set();     // include slugs
 let saucepanExcludedTags = new Set();   // exclude slugs
 let saucepanDiscoveredTags = new Set(); // slugs harvested from result rows
+let saucepanMatchAnyTag = false;        // false = AND (all tags), true = OR (any tag)
 
 // Content filters. NSFW defaults OFF (opt-in via toggle, like every other
 // provider) and maps to the server `sus` param; hide-extreme is an opt-OUT that
@@ -96,8 +97,22 @@ let saucepanDiscoveredTags = new Set(); // slugs harvested from result rows
 // exclude nothing).
 let saucepanNsfwEnabled = false;
 let saucepanHideExtreme = false;
+let saucepanHideExtraSpicy = false;
 let saucepanFilterHideOwned = false;
 let saucepanFilterHidePossible = false;
+
+// Server-side "card must have" filters (min_*_count) and posted-within window.
+let saucepanFilterHasPortraits = false;
+let saucepanFilterHasLorebook = false;
+let saucepanFilterHasScenarios = false;
+let saucepanPostedWithinDays = 0; // 0 = any time
+
+// yyyy-MM-dd string for a "posted within N days" window, or null.
+function postedAfterDate() {
+    if (!saucepanPostedWithinDays) return null;
+    const d = new Date(Date.now() - saucepanPostedWithinDays * 86400000);
+    return d.toISOString().slice(0, 10);
+}
 
 // Tri-state fandom filtering (franchise / source-material — a Saucepan dimension
 // distinct from regular tags, fetched from /api/v1/fandoms).
@@ -451,6 +466,9 @@ const SAUCEPAN_SORT_OPTIONS = [
     { value: 'saucepan_new', label: '🆕 New' },
     { value: 'saucepan_trending', label: '🔥 Trending' },
     { value: 'saucepan_popular', label: '👑 Popular' },
+    { value: 'saucepan_updated', label: '🔄 Recently Updated' },
+    { value: 'saucepan_oldest', label: '🕐 Oldest' },
+    { value: 'saucepan_random', label: '🎲 Random' },
 ];
 
 const CREATOR_SORT_OPTIONS = [
@@ -466,6 +484,11 @@ function buildSortOptionsHtml(selected) {
 }
 
 function updateSortOptions() {
+    // Posted-within only applies to server search, not creator browsing.
+    const postedEl = document.getElementById('saucepanPostedWithinSelect');
+    const postedTarget = postedEl?._customSelect?.container || postedEl;
+    postedTarget?.classList.toggle('browse-filter-hidden', saucepanBrowseMode === 'creator');
+
     const el = document.getElementById('saucepanSortSelect');
     if (!el) return;
     if (saucepanBrowseMode === 'creator') {
@@ -672,8 +695,14 @@ async function loadCharacters(append = false) {
                 excludedTags: [...mergedExclude],
                 nsfw: saucepanNsfwEnabled,
                 hideExtreme: saucepanHideExtreme,
+                hideExtraSpicy: saucepanHideExtraSpicy,
                 fandomTags: [...saucepanActiveFandoms],
                 excludedFandomTags: [...saucepanExcludedFandoms],
+                matchAllTags: !saucepanMatchAnyTag,
+                postedAfter: postedAfterDate(),
+                minPortraits: saucepanFilterHasPortraits ? 1 : 0,
+                minLorebooks: saucepanFilterHasLorebook ? 1 : 0,
+                minScenarios: saucepanFilterHasScenarios ? 1 : 0,
             });
             list = data?.characters || [];
             total = data?.totalCount || 0;
@@ -907,7 +936,10 @@ function updateOpenDefToggle() {
 function updateFiltersButtonState() {
     const btn = document.getElementById('saucepanFiltersBtn');
     if (!btn) return;
-    const count = [saucepanFilterHideOwned, saucepanFilterHidePossible].filter(Boolean).length;
+    const count = [
+        saucepanFilterHideOwned, saucepanFilterHidePossible,
+        saucepanFilterHasPortraits, saucepanFilterHasLorebook, saucepanFilterHasScenarios,
+    ].filter(Boolean).length;
     btn.classList.toggle('has-filters', count > 0);
     btn.innerHTML = count > 0
         ? `<i class="fa-solid fa-sliders"></i> Features (${count})`
@@ -1530,6 +1562,7 @@ function initSaucepanView() {
     // Default OFF: NSFW is an explicit opt-in.
     saucepanNsfwEnabled = getSetting('saucepanNsfw') === true;
     saucepanHideExtreme = getSetting('saucepanHideExtreme') === true;
+    saucepanHideExtraSpicy = getSetting('saucepanHideExtraSpicy') === true;
 
     if (delegatesInitialized) return;
     delegatesInitialized = true;
@@ -1543,6 +1576,11 @@ function initSaucepanView() {
     if (creatorSortEl) {
         creatorSortEl.value = saucepanCreatorSortMode;
         CoreAPI.initCustomSelect?.(creatorSortEl);
+    }
+    const postedWithinEl = document.getElementById('saucepanPostedWithinSelect');
+    if (postedWithinEl) {
+        postedWithinEl.value = String(saucepanPostedWithinDays);
+        CoreAPI.initCustomSelect?.(postedWithinEl);
     }
 
     // Grid card click -> open preview / browse creator (delegation)
@@ -1704,6 +1742,50 @@ function initSaucepanView() {
             saucepanHideExtreme = e.target.checked;
             setSetting('saucepanHideExtreme', saucepanHideExtreme);
             if (saucepanBrowseMode !== 'creator') {
+                saucepanCurrentPage = 1;
+                loadCharacters(false);
+            }
+        });
+    }
+
+    // Server-side filter checkboxes: flip state, re-query (search mode only).
+    const serverFilterCheckboxes = [
+        { id: 'saucepanHideExtraSpicy', setter: (v) => saucepanHideExtraSpicy = v, getter: () => saucepanHideExtraSpicy, persistKey: 'saucepanHideExtraSpicy' },
+        { id: 'saucepanFilterHasPortraits', setter: (v) => saucepanFilterHasPortraits = v, getter: () => saucepanFilterHasPortraits },
+        { id: 'saucepanFilterHasLorebook', setter: (v) => saucepanFilterHasLorebook = v, getter: () => saucepanFilterHasLorebook },
+        { id: 'saucepanFilterHasScenarios', setter: (v) => saucepanFilterHasScenarios = v, getter: () => saucepanFilterHasScenarios },
+    ];
+    serverFilterCheckboxes.forEach(({ id, setter, getter, persistKey }) => {
+        const cb = document.getElementById(id);
+        if (!cb) return;
+        cb.checked = getter();
+        cb.addEventListener('change', (e) => {
+            setter(e.target.checked);
+            if (persistKey) setSetting(persistKey, e.target.checked);
+            updateFiltersButtonState();
+            if (saucepanBrowseMode !== 'creator') {
+                saucepanCurrentPage = 1;
+                loadCharacters(false);
+            }
+        });
+    });
+
+    // Posted-within window (server filter: posted_at_from)
+    on('saucepanPostedWithinSelect', 'change', (e) => {
+        saucepanPostedWithinDays = parseInt(e.target.value, 10) || 0;
+        if (saucepanBrowseMode !== 'creator') {
+            saucepanCurrentPage = 1;
+            loadCharacters(false);
+        }
+    });
+
+    // Tag match mode (AND/OR — server filter: match_all_tags)
+    const matchAnyCb = document.getElementById('saucepanMatchAnyTag');
+    if (matchAnyCb) {
+        matchAnyCb.checked = saucepanMatchAnyTag;
+        matchAnyCb.addEventListener('change', (e) => {
+            saucepanMatchAnyTag = e.target.checked;
+            if (saucepanBrowseMode !== 'creator' && saucepanActiveTags.size > 0) {
                 saucepanCurrentPage = 1;
                 loadCharacters(false);
             }
@@ -1901,6 +1983,7 @@ class SaucepanBrowseView extends BrowseView {
     get mobileFilterIds() {
         return {
             sort: 'saucepanSortSelect',
+            subSort: 'saucepanPostedWithinSelect',
             tags: 'saucepanTagsBtn',
             fandoms: 'saucepanFandomsBtn',
             filters: 'saucepanFiltersBtn',
@@ -1915,6 +1998,9 @@ class SaucepanBrowseView extends BrowseView {
                 { value: 'saucepan_new', label: 'New' },
                 { value: 'saucepan_trending', label: 'Trending' },
                 { value: 'saucepan_popular', label: 'Popular' },
+                { value: 'saucepan_updated', label: 'Recently Updated' },
+                { value: 'saucepan_oldest', label: 'Oldest' },
+                { value: 'saucepan_random', label: 'Random' },
             ],
             followingSortOptions: [],
             viewModes: [],
@@ -1953,6 +2039,18 @@ class SaucepanBrowseView extends BrowseView {
                 </select>
             </div>
 
+            <!-- Posted-within window -->
+            <div class="browse-sort-container">
+                <select id="saucepanPostedWithinSelect" class="glass-select" title="Only show cards posted within this window">
+                    <option value="0">📅 Any time</option>
+                    <option value="1">📅 Past 24 hours</option>
+                    <option value="7">📅 Past week</option>
+                    <option value="30">📅 Past month</option>
+                    <option value="90">📅 Past 3 months</option>
+                    <option value="365">📅 Past year</option>
+                </select>
+            </div>
+
             <!-- Tags -->
             <div class="browse-tags-dropdown-container" style="position: relative;">
                 <button id="saucepanTagsBtn" class="glass-btn" title="Tag filters">
@@ -1965,6 +2063,7 @@ class SaucepanBrowseView extends BrowseView {
                             <i class="fa-solid fa-rotate-left"></i>
                         </button>
                     </div>
+                    <label class="filter-checkbox" title="Off: results must match every included tag. On: results may match any included tag."><input type="checkbox" id="saucepanMatchAnyTag"> <i class="fa-solid fa-shuffle"></i> Match Any Tag (OR)</label>
                     <div class="browse-tags-list" id="saucepanTagsList"></div>
                 </div>
             </div>
@@ -1996,6 +2095,11 @@ class SaucepanBrowseView extends BrowseView {
                     <label class="filter-checkbox"><input type="checkbox" id="saucepanFilterHidePossible"> <i class="fa-solid fa-check" style="color: #f0a500;"></i> Hide Possible Matches</label>
                     <div class="dropdown-section-title">Content:</div>
                     <label class="filter-checkbox" title="Exclude gore, noncon, self-harm and other extreme-content tags (Saucepan's default content-warning list)"><input type="checkbox" id="saucepanHideExtreme"> <i class="fa-solid fa-triangle-exclamation" style="color: #e06c6c;"></i> Hide Extreme Content</label>
+                    <label class="filter-checkbox" title="Exclude cards Saucepan marks as extra spicy"><input type="checkbox" id="saucepanHideExtraSpicy"> <i class="fa-solid fa-pepper-hot" style="color: #e06c6c;"></i> Hide Extra Spicy</label>
+                    <div class="dropdown-section-title">Card must have:</div>
+                    <label class="filter-checkbox"><input type="checkbox" id="saucepanFilterHasPortraits"> <i class="fa-solid fa-images"></i> Extra Portraits</label>
+                    <label class="filter-checkbox"><input type="checkbox" id="saucepanFilterHasLorebook"> <i class="fa-solid fa-book"></i> Lorebook</label>
+                    <label class="filter-checkbox"><input type="checkbox" id="saucepanFilterHasScenarios"> <i class="fa-solid fa-clapperboard"></i> Scenarios</label>
                 </div>
             </div>
 

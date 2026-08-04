@@ -31,10 +31,14 @@ export function saucepanCompanionUrl(id) {
     return `https://saucepan.ai/companion/${id}`;
 }
 
+// order_by/asc pairs verified against Saucepan's own sort dropdown (web bundle).
 const SAUCEPAN_ORDER_MAP = {
-    saucepan_new: 'created',
-    saucepan_trending: 'trending',
-    saucepan_popular: 'popularity',
+    saucepan_new: { order: 'created', asc: false },
+    saucepan_oldest: { order: 'created', asc: true },
+    saucepan_trending: { order: 'trending', asc: false },
+    saucepan_popular: { order: 'popularity', asc: false },
+    saucepan_updated: { order: 'updated', asc: false },
+    saucepan_random: { order: 'random', asc: false },
 };
 
 // Saucepan's own default "content warning" exclusion list — the extreme-content
@@ -201,10 +205,12 @@ export function resolveSaucepanImageUrl(url) {
  * @param {string} [opts.search='']
  * @param {number} [opts.page=1]
  * @param {number} [opts.limit=96]
- * @param {string} [opts.sort='saucepan_new']
+ * @param {string} [opts.sort='saucepan_new'] - Key of SAUCEPAN_ORDER_MAP
  * @param {boolean} [opts.openDefinitionOnly=true]
- * @param {string[]} [opts.tags=[]] - Tag slugs to include (AND match)
+ * @param {string[]} [opts.tags=[]] - Tag slugs to include
+ * @param {boolean} [opts.matchAllTags=true] - Included tags: AND (true) or OR (false)
  * @param {string[]} [opts.excludedTags=[]] - Tag slugs to exclude
+ * @param {string|null} [opts.postedAfter=null] - yyyy-MM-dd lower bound on posted_at
  * @returns {Promise<{characters: Object[], totalCount: number, totalPages: number}>}
  */
 export async function searchSaucepan(opts = {}) {
@@ -224,8 +230,18 @@ export async function searchSaucepan(opts = {}) {
         fandomTags = [],
         excludedFandomTags = [],
         matchAllFandomTags = false,
+        // AND (true) vs OR (false) matching for included tags
+        matchAllTags = true,
+        // yyyy-MM-dd lower bound on posted_at, or null for any time
+        postedAfter = null,
+        // "Card must have" minimum counts (0 = don't filter)
+        minPortraits = 0,
+        minLorebooks = 0,
+        minScenarios = 0,
+        // true → exclude extra-spicy content (extra_spicy:false); false → no filter (extra_spicy:null)
+        hideExtraSpicy = false,
     } = opts;
-    const orderBy = SAUCEPAN_ORDER_MAP[sort] || 'created';
+    const { order: orderBy, asc } = SAUCEPAN_ORDER_MAP[sort] || SAUCEPAN_ORDER_MAP.saucepan_new;
     const offset = Math.max(0, (page - 1) * limit);
 
     const baseExcluded = Array.isArray(excludedTags) ? excludedTags : [];
@@ -243,12 +259,16 @@ export async function searchSaucepan(opts = {}) {
         limit,
         offset,
         sus: !!nsfw,
-        extra_spicy: null,
+        extra_spicy: hideExtraSpicy ? false : null,
         order_by: orderBy,
-        asc: false,
-        posted_at_from: null,
+        asc,
+        posted_at_from: postedAfter || null,
         posted_at_to: null,
-        match_all_tags: true,
+        match_all_tags: !!matchAllTags,
+        min_portrait_count: minPortraits || 0,
+        min_group_count: 0,
+        min_lorebook_count: minLorebooks || 0,
+        min_scenario_count: minScenarios || 0,
         hide_hidden_content: false,
         open_definition_only: openDefinitionOnly,
     };
@@ -422,6 +442,184 @@ export async function fetchSaucepanFandoms() {
 }
 
 // ========================================
+// LOREBOOKS
+// ========================================
+
+// A card can cite several lorebooks; V2 has one character_book, so they merge
+// into a single book and each entry keeps its source in `comment`.
+//
+// Saucepan chapters carry no keyword field, and the books run large (a typical
+// three-book card totals ~113k tokens), so importing them always-on would swamp
+// every prompt. Keys are derived from the chapter title instead, plus the
+// "-# Tags; a, b, c" line some creators write as an ad-hoc keyword list.
+const SAUCEPAN_TAGS_LINE = /^\s*-#\s*Tags?\s*[;:]\s*(.+)$/im;
+
+/**
+ * Keyword list for a chapter. Title-derived, since Saucepan has no keys field.
+ * @param {string} title
+ * @param {string} text - raw chapter text (scanned for a "-# Tags;" line)
+ * @returns {string[]}
+ */
+function saucepanChapterKeys(title, text) {
+    const keys = new Set();
+    // Titles are commonly numbered ("3. Skin, Fur & External Covering",
+    // "5, 6, 10. Organ and Basic Bodily Operations."); the numbering is not a
+    // useful trigger, and neither is a trailing period.
+    const cleaned = String(title || '').replace(/^[\s\d.,)\-]+/, '').replace(/\.\s*$/, '').trim();
+    if (cleaned) keys.add(cleaned);
+    // A compound title is usually several distinct lookup terms. Splitting can
+    // cut through a bracketed aside ("Skeletal System (Bones & Structure)"), so
+    // drop the orphaned bracket rather than key on "Structure)".
+    for (const part of cleaned.split(/\s*[&/,]\s*/)) {
+        const p = part.replace(/[()[\]{}]/g, ' ').replace(/\s+/g, ' ').trim();
+        if (p.length > 3) keys.add(p);
+    }
+    const tagLine = String(text || '').match(SAUCEPAN_TAGS_LINE);
+    if (tagLine) {
+        for (const t of tagLine[1].split(/[,;]/)) {
+            const k = t.trim();
+            if (k) keys.add(k);
+        }
+    }
+    return [...keys].slice(0, 32);
+}
+
+/**
+ * Strip Saucepan's display-only markup from chapter text.
+ * `<notcontext>` flags a line Saucepan itself keeps out of the prompt (headings,
+ * attribution, rules) — dropping those lines matches what the card actually runs.
+ * @param {string} text
+ * @returns {string}
+ */
+function saucepanChapterText(text) {
+    return String(text || '')
+        .split('\n')
+        .filter(line => !line.includes('<notcontext>'))
+        .join('\n')
+        .replace(/<br\s*\/?>/gi, '\n')
+        .trim();
+}
+
+/**
+ * Fetch a companion's readable lorebooks and merge them into one V2 character_book.
+ * Books the creator gated are skipped rather than imported as empty shells.
+ * @param {string} companionId - companion UUID
+ * @returns {Promise<Object|null>} V2 character_book, or null if none readable
+ */
+export async function fetchSaucepanLorebook(companionId) {
+    if (!companionId) return null;
+
+    let books;
+    try {
+        const resp = await saucepanFetch('GET', `/api/v1/companions/${encodeURIComponent(companionId)}/lorebooks`);
+        if (!resp.ok) return null;
+        books = (await resp.json())?.lorebooks;
+    } catch {
+        return null;
+    }
+    if (!Array.isArray(books) || books.length === 0) return null;
+
+    const entries = [];
+    const names = [];
+    let skipped = 0;
+    let unkeyable = 0;
+
+    for (const book of books) {
+        if (!book?.id) continue;
+        // Lorebooks carry their own lock, same shape as a definition's.
+        if (book.definition_protection && book.definition_protection !== 'open') {
+            skipped++;
+            continue;
+        }
+        let data;
+        try {
+            const resp = await saucepanFetch('GET', `/api/v1/lorebooks/${encodeURIComponent(book.id)}`);
+            if (!resp.ok) { skipped++; continue; }
+            data = await resp.json();
+        } catch {
+            skipped++;
+            continue;
+        }
+        // can_read is the server's own verdict; trust it over the listing flag.
+        if (data?.can_read && data.can_read !== 'open') {
+            skipped++;
+            continue;
+        }
+
+        const bookName = data?.name || book.name || 'Saucepan lorebook';
+        const chapters = Array.isArray(data?.content) ? data.content : [];
+        let added = 0;
+        for (const chapter of chapters) {
+            const content = saucepanChapterText(chapter?.text);
+            if (!content) continue;
+            const title = String(chapter?.title || '').trim();
+            const keys = saucepanChapterKeys(title, chapter?.text);
+            // Purely numbered titles ("10.") leave nothing to trigger on. A
+            // keyless non-constant entry can never fire, so it would only pad
+            // the card; skip it rather than ship dead weight.
+            if (keys.length === 0) {
+                unkeyable++;
+                continue;
+            }
+            entries.push({
+                keys,
+                content,
+                extensions: {},
+                enabled: true,
+                insertion_order: entries.length,
+                case_sensitive: false,
+                name: title,
+                comment: title ? `${bookName} — ${title}` : bookName,
+                selective: false,
+                secondary_keys: [],
+                constant: false,
+                position: 'before_char',
+            });
+            added++;
+        }
+        if (added > 0) names.push(bookName);
+    }
+
+    if (entries.length === 0) return null;
+    if (skipped > 0) {
+        console.warn(`[Saucepan] Skipped ${skipped} unreadable lorebook(s) for companion ${companionId}`);
+    }
+    if (unkeyable > 0) {
+        console.warn(`[Saucepan] Skipped ${unkeyable} lorebook chapter(s) with no derivable keyword for companion ${companionId}`);
+    }
+
+    return {
+        name: names.join(' + ').slice(0, 200),
+        description: `Imported from Saucepan (${names.length} lorebook${names.length === 1 ? '' : 's'}, ${entries.length} entries)`,
+        scan_depth: 4,
+        token_budget: 2048,
+        recursive_scanning: false,
+        extensions: {},
+        entries,
+    };
+}
+
+/**
+ * Attach a companion's lorebooks to a freshly built V2 card, in place.
+ *
+ * Every path that builds a Saucepan card goes through here — import, preview and
+ * the update-check fetch alike. They must agree: card-updates always diffs
+ * character_book, so a path that skipped this would report an imported lorebook
+ * as remotely deleted on the next check.
+ *
+ * @param {Object|null} card - V2 card from buildV2FromSaucepan (null passes through)
+ * @param {string} companionId
+ * @returns {Promise<Object|null>} the same card
+ */
+export async function attachSaucepanLorebook(card, companionId) {
+    if (!card?.data || !companionId) return card;
+    // Entirely optional: a card with no books, or only gated ones, still imports.
+    const book = await fetchSaucepanLorebook(companionId);
+    if (book) card.data.character_book = book;
+    return card;
+}
+
+// ========================================
 // NATIVE EXTRACTION
 // ========================================
 
@@ -577,10 +775,11 @@ export function buildSaucepanCharacterFromHit(hit, v2Card) {
  */
 export async function fetchSaucepanV2Card(hit) {
     if (!hit?.character_id && !hit?.id) return null;
-    const result = await submitSaucepanExtraction(saucepanCompanionUrl(hit.character_id || hit.id));
+    const id = hit.character_id || hit.id;
+    const result = await submitSaucepanExtraction(saucepanCompanionUrl(id));
     if (!result.success) {
         console.warn('[Saucepan] Native extraction failed:', result.error);
         return null;
     }
-    return buildV2FromSaucepan(hit, result);
+    return attachSaucepanLorebook(buildV2FromSaucepan(hit, result), id);
 }

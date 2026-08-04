@@ -9,6 +9,14 @@
     padding: 6px 10px;
 }
 
+/* Posted-within select: fully collapse (not just visibility-hide) in creator
+   mode so it doesn't leave a gap in the filter bar — same pattern botbooru
+   uses for its mode-gated sort selects. */
+#saucepanPostedWithinSelect.browse-filter-hidden,
+[data-select-id="saucepanPostedWithinSelect"].browse-filter-hidden {
+    display: none;
+}
+
 /* Mobile overrides */
 
 html.cl-mobile #saucepanCreatorSortSelect, html.cl-mobile [data-select-id="saucepanCreatorSortSelect"] { min-width: 0; flex: 1; font-size: var(--font-sm); }
