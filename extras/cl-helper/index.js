@@ -2199,295 +2199,6 @@ class CdpPage {
     async close() { try { await this.client.send('Target.closeTarget', { targetId: this.targetId }); } catch {} }
 }
 
-// =============================================================================
-// Camoufox backend (stealth Firefox, driven through Playwright)
-// =============================================================================
-//
-// `managed` mode runs Camoufox; an explicit endpoint still speaks CDP to a Chrome. Camoufox is a
-// patched Firefox and cannot speak CDP at all, so the two adapters below expose exactly the
-// surface the janitorai routes already use (goto/evaluate/cookies/captureResponse/close) and
-// those routes stay untouched.
-//
-// Pinned to playwright-core <1.61: later builds change the juggler protocol Camoufox 152 speaks.
-//
-// The fingerprint comes from camoufox-js (fonts, WebGL parameter tables, screen geometry, uBlock),
-// which is worth a dependency: a hand-written config cannot approximate it, and a half-spoofed
-// browser is more identifiable than an unspoofed one. Upstream camoufox-js refuses win/arm64
-// outright, so this expects the patched fork (frogicporn/camoufox-js) — the browser is a separate
-// process, so the x86_64 build runs under emulation while the package's own native bindings stay
-// on the host arch. camoufoxConfig() below is the degraded fallback for when it is unavailable.
-
-const CAMOUFOX_ENDPOINT = 'camoufox://managed';
-const CAMOUFOX_IDLE_MS = 10 * 60 * 1000;
-let _camoufox = null;         // { context, profile, lastUsed }
-let _camoufoxPending = null;
-let _camoufoxReaper = null;
-
-function camoufoxExecutable() {
-    if (process.env.CL_CAMOUFOX) return process.env.CL_CAMOUFOX;
-    const name = process.platform === 'win32' ? 'camoufox.exe' : 'camoufox';
-    const roots = [join(homedir(), 'camoufox'), join(homedir(), '.cache', 'camoufox')];
-    if (process.env.CAMOUFOX_INSTALL_DIR) roots.unshift(process.env.CAMOUFOX_INSTALL_DIR);
-    for (const dir of roots) {
-        const p = join(dir, name);
-        if (existsSync(p)) return p;
-    }
-    return null;
-}
-
-/**
- * Fallback only. Camoufox's built-in default advertises "Camoufox/<version>" in the User-Agent,
- * which is a louder tell than anything it hides, so at minimum that has to go. Real fingerprints
- * come from camoufoxLaunchOptions(); this is what is left when camoufox-js cannot load.
- */
-function camoufoxConfig() {
-    const ff = '133.0';
-    if (process.platform === 'darwin') {
-        return {
-            'navigator.userAgent': `Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:${ff}) Gecko/20100101 Firefox/${ff}`,
-            'navigator.platform': 'MacIntel',
-        };
-    }
-    if (process.platform === 'linux') {
-        return {
-            'navigator.userAgent': `Mozilla/5.0 (X11; Linux x86_64; rv:${ff}) Gecko/20100101 Firefox/${ff}`,
-            'navigator.platform': 'Linux x86_64',
-        };
-    }
-    return {
-        'navigator.userAgent': `Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:${ff}) Gecko/20100101 Firefox/${ff}`,
-        'navigator.platform': 'Win32',
-        'navigator.oscpu': 'Windows NT 10.0; Win64; x64',
-    };
-}
-
-const CAMOUFOX_OS = { win32: 'windows', darwin: 'macos', linux: 'linux' }[process.platform] || 'linux';
-
-/**
- * Playwright launch options carrying a full camoufox-js fingerprint, or a minimal hand-built one
- * if camoufox-js is missing or rejects this platform. Never throws: a degraded fingerprint still
- * browses, and failing the launch outright would take the provider down with it.
- */
-async function camoufoxLaunchOptions(exe, headless) {
-    const fallback = {
-        executablePath: exe,
-        env: { CAMOU_CONFIG: JSON.stringify(camoufoxConfig()) },
-    };
-    try {
-        const { launchOptions } = await import('camoufox-js');
-        // camoufox-js resolves the browser (and its version.json) from here.
-        if (!process.env.CAMOUFOX_INSTALL_DIR) process.env.CAMOUFOX_INSTALL_DIR = dirname(exe);
-        const o = await launchOptions({ headless, os: CAMOUFOX_OS, humanize: true });
-        // Only the keys launchPersistentContext takes; `proxy: null` would be rejected outright.
-        return {
-            executablePath: o.executablePath || exe,
-            args: o.args,
-            firefoxUserPrefs: o.firefoxUserPrefs,
-            env: o.env,
-        };
-    } catch (e) {
-        console.warn(`[cl-helper] camoufox-js unavailable (${e.message}); using a minimal fingerprint.`);
-        return fallback;
-    }
-}
-
-function camoufoxProfileDir(req) {
-    const charactersDir = charactersDirForReq(req);
-    return charactersDir ? join(charactersDir, '..', 'cl_janitorai_camoufox') : join(tmpdir(), 'cl_janitorai_camoufox');
-}
-
-async function stopCamoufox() {
-    const cf = _camoufox;
-    _camoufox = null;
-    if (cf) { try { await cf.context.close(); } catch {} }
-}
-
-function armCamoufoxReaper() {
-    if (_camoufoxReaper) return;
-    _camoufoxReaper = setInterval(() => {
-        if (_camoufox && Date.now() - _camoufox.lastUsed > CAMOUFOX_IDLE_MS) stopCamoufox().catch(() => {});
-        if (!_camoufox) { clearInterval(_camoufoxReaper); _camoufoxReaper = null; }
-    }, 60000);
-    _camoufoxReaper.unref?.();
-}
-
-/**
- * A persistent context, not launch()+newContext(): cookies have to survive a SillyTavern restart
- * or every session would start at the login form again (and behind its captcha).
- */
-async function getCamoufoxContext(req, force = false) {
-    if (force) await stopCamoufox();
-    // Reuse only a context that is actually up. It can die outside stopCamoufox -- a crash, an
-    // OOM, or the user closing the headful window after solving the captcha -- and the old code
-    // returned that dead reference on every later call, so the browser never came back until a
-    // full SillyTavern restart. isConnected() is the synchronous guard; the 'close' listener
-    // below is the belt-and-suspenders that clears the slot the moment the context dies.
-    if (_camoufox && _camoufox.context.browser()?.isConnected()) {
-        _camoufox.lastUsed = Date.now();
-        return _camoufox.context;
-    }
-    if (_camoufox) await stopCamoufox();
-    if (_camoufoxPending) return _camoufoxPending;
-
-    _camoufoxPending = (async () => {
-        const exe = camoufoxExecutable();
-        if (!exe) {
-            throw new Error('Camoufox was not found. Install it with `npx camoufox-js fetch`, or set CL_CAMOUFOX to the camoufox binary.');
-        }
-        let firefox;
-        try {
-            ({ firefox } = await import('playwright-core'));
-        } catch {
-            throw new Error('playwright-core is missing from the cl-helper plugin folder. Run `npm install playwright-core@1.60.0` there and restart SillyTavern.');
-        }
-        const profile = camoufoxProfileDir(req);
-        try { mkdirSync(profile, { recursive: true }); } catch {}
-        // Headful is the only way to answer an interactive Turnstile. The profile persists, so
-        // one manual sign-in is enough and later runs can go back to headless.
-        const headless = process.env.CL_CAMOUFOX_HEADFUL !== '1';
-        const opts = await camoufoxLaunchOptions(exe, headless);
-        const context = await firefox.launchPersistentContext(profile, {
-            ...opts,
-            headless,
-            viewport: { width: 1280, height: 900 },
-            // Playwright REPLACES the environment rather than extending it, so the browser would
-            // lose PATH and friends if the fingerprint vars were passed on their own.
-            env: { ...process.env, ...opts.env },
-            timeout: CDP_CONNECT_TIMEOUT * 4,
-        });
-        // The browser must not outlive SillyTavern.
-        const killer = () => { try { context.close(); } catch {} };
-        process.once('exit', killer);
-        process.once('SIGTERM', killer);
-        process.once('SIGINT', killer);
-        _camoufox = { context, profile, lastUsed: Date.now() };
-        // Clear the reference the instant the context dies for any reason, so the next call
-        // relaunches instead of tripping over a dead handle. Guarded so a stale close from an
-        // already-replaced context cannot null a newer one.
-        context.once('close', () => { if (_camoufox?.context === context) _camoufox = null; });
-        armCamoufoxReaper();
-        console.log(`[cl-helper] camoufox up (${exe})`);
-        return context;
-    })().finally(() => { _camoufoxPending = null; });
-
-    return _camoufoxPending;
-}
-
-class CamoufoxClient {
-    constructor(context) {
-        this.context = context;
-        const v = context.browser()?.version?.();
-        this.info = { Browser: v ? `Camoufox/${v}` : 'Camoufox' };
-    }
-
-    // Read live, not latched: the warm-page cache reuses a client only while this is false, and
-    // the idle reaper can close the shared context out from under it.
-    get _closed() { return !this.context.browser()?.isConnected(); }
-
-    static async connect(_endpoint, req) {
-        return new CamoufoxClient(await getCamoufoxContext(req));
-    }
-
-    // The persistent context is shared and outlives any one caller; the idle reaper owns it.
-    close() {}
-}
-
-class CamoufoxPage {
-    constructor(client, page) {
-        this.client = client;
-        this.page = page;
-    }
-
-    static async create(client) {
-        return new CamoufoxPage(client, await client.context.newPage());
-    }
-
-    async goto(url, { timeout = CDP_NAV_TIMEOUT } = {}) {
-        // 'domcontentloaded', not 'load': janitorai's app holds connections open, so a signed-in
-        // session redirecting away from /login never fires load in Firefox and the navigation
-        // times out on a page that is already usable. Every caller sleeps or polls afterwards.
-        await this.page.goto(url, { timeout, waitUntil: 'domcontentloaded' });
-    }
-
-    async evaluate(expression, { timeout = CDP_COMMAND_TIMEOUT } = {}) {
-        return withTimeout(this.page.evaluate(expression), timeout, 'page evaluate');
-    }
-
-    async cookies(urls) {
-        return this.client.context.cookies(urls);
-    }
-
-    /**
-     * Shim for the handful of raw CDP sends the routes still make (cookie writes, reload).
-     * Playwright exposes no generic CDP channel for Firefox, so each method is mapped by hand and
-     * anything unmapped throws loudly rather than silently doing nothing.
-     */
-    async send(method, params = {}) {
-        switch (method) {
-            case 'Page.reload':
-                await this.page.reload({ timeout: CDP_NAV_TIMEOUT });
-                return {};
-            case 'Network.setCookie': {
-                const { name, value, domain, path, expires, httpOnly, secure, sameSite } = params;
-                await this.client.context.addCookies([{
-                    name,
-                    value,
-                    domain,
-                    path: path || '/',
-                    ...(typeof expires === 'number' ? { expires } : {}),
-                    httpOnly: !!httpOnly,
-                    secure: !!secure,
-                    sameSite: ['Strict', 'Lax', 'None'].includes(sameSite) ? sameSite : 'Lax',
-                }]);
-                return { success: true };
-            }
-            case 'Network.deleteCookies':
-                await this.client.context.clearCookies({
-                    ...(params.name ? { name: params.name } : {}),
-                    ...(params.domain ? { domain: params.domain } : {}),
-                    ...(params.path ? { path: params.path } : {}),
-                });
-                return {};
-            case 'Network.getCookies':
-                return { cookies: await this.client.context.cookies(params.urls) };
-            // Page/Runtime/Network.enable are CDP domain toggles with no Playwright equivalent;
-            // the domains they gate are always on here, so accepting them is correct, not a stub.
-            case 'Page.enable':
-            case 'Runtime.enable':
-            case 'Network.enable':
-                return {};
-            default:
-                throw new Error(`Camoufox backend does not implement CDP method ${method}`);
-        }
-    }
-
-    /** Same one-shot contract as the CDP version: arm before triggering, then wait(). */
-    captureResponse(re, { timeout = 45000 } = {}) {
-        let cancelled = false;
-        const done = this.page
-            .waitForResponse(r => re.test(r.url()), { timeout })
-            .then(r => r.text())
-            .catch(() => null);
-        return {
-            wait: () => (cancelled ? Promise.resolve(null) : done),
-            cancel: () => { cancelled = true; done.catch(() => {}); },
-        };
-    }
-
-    async close() { try { await this.page.close(); } catch {} }
-}
-
-const isCamoufoxEndpoint = (e) => typeof e === 'string' && e.startsWith('camoufox://');
-
-/** Connect to whichever backend the endpoint names, so callers stay backend-agnostic. */
-function browserConnect(endpoint, req) {
-    return isCamoufoxEndpoint(endpoint) ? CamoufoxClient.connect(endpoint, req) : CdpClient.connect(endpoint);
-}
-
-function browserNewPage(client) {
-    return client instanceof CamoufoxClient ? CamoufoxPage.create(client) : CdpPage.create(client);
-}
-
 /** Build an in-page fetch against janitorai, as an expression string for Runtime.evaluate. */
 function janitoraiCall(method, path, body, token) {
     const headers = { Accept: 'application/json' };
@@ -2686,11 +2397,11 @@ async function injectJanitoraiSession(page, accessToken, refreshToken) {
 }
 
 /** Open a page, run `fn`, always tear the page down. */
-async function withJanitoraiPage(endpoint, fn, req) {
-    const client = await browserConnect(endpoint, req);
+async function withJanitoraiPage(endpoint, fn) {
+    const client = await CdpClient.connect(endpoint);
     let page = null;
     try {
-        page = await browserNewPage(client);
+        page = await CdpPage.create(client);
         return await fn(page, client);
     } finally {
         if (page) await page.close();
@@ -2728,12 +2439,9 @@ function armWarmReaper() {
     _warmReaper.unref?.();
 }
 
-async function getWarmPage(endpoint, req) {
+async function getWarmPage(endpoint) {
     if (_warmPage && _warmPage.endpoint === endpoint && !_warmPage.client._closed) {
         _warmPage.lastUsed = Date.now();
-        // Reusing the warm page never re-enters getCamoufoxContext, so without this the shared
-        // context's idle clock freezes at creation and its reaper closes the browser mid-browse.
-        if (isCamoufoxEndpoint(endpoint) && _camoufox) _camoufox.lastUsed = Date.now();
         return _warmPage;
     }
     // Concurrent grid requests must share one warm-up, not race a dozen navigations. Joining is
@@ -2753,10 +2461,10 @@ async function getWarmPage(endpoint, req) {
     let wrapped;
     wrapped = (async () => {
         await closeWarmPage();
-        const client = await browserConnect(endpoint, req);
+        const client = await CdpClient.connect(endpoint);
         let page;
         try {
-            page = await browserNewPage(client);
+            page = await CdpPage.create(client);
             await page.goto(`${JANITORAI_ORIGIN}/`, { timeout: CDP_NAV_TIMEOUT });
             // Park only once the challenge is done, so the first real request is not spent on it.
             await waitForCloudflare(page);
@@ -2961,8 +2669,13 @@ async function getManagedEndpoint(req, force = false) {
         }
 
         const ua = await probeManagedUserAgent(binary);
+        // janitorai puts an interactive Turnstile checkbox on the login form, which cannot be
+        // answered in a headless browser: the sign-in simply never produces a session. CL_HEADFUL=1
+        // shows the window so it can be clicked once; the profile persists, so later runs can go
+        // back to headless with the session intact.
+        const headful = process.env.CL_HEADFUL === '1';
         const flags = [
-            '--headless=new',
+            ...(headful ? [] : ['--headless=new']),
             `--remote-debugging-port=${port}`,
             `--user-data-dir=${profile}`,
             '--no-first-run',
@@ -3013,7 +2726,7 @@ async function getManagedEndpoint(req, force = false) {
         _managedLastError = null;
         _managedFailedAt = 0;
         armManagedReaper();
-        console.log(`[cl-helper] managed browser up: ${info.Browser} (${binary})`);
+        console.log(`[cl-helper] managed browser up${headful ? ' (headful)' : ''}: ${info.Browser} (${binary})`);
         return endpoint;
     })().catch((e) => { _managedLastError = e.message; _managedFailedAt = Date.now(); throw e; })
         .finally(() => { _managedPending = null; _managedStarting = null; });
@@ -3028,12 +2741,7 @@ async function getManagedEndpoint(req, force = false) {
  */
 async function resolveBrowserEndpoint(req, force = false) {
     const { endpoint, managed } = req.body ?? {};
-    // Managed mode runs Camoufox now. An explicit endpoint is still a CDP URL for a Chrome the
-    // user runs themselves, so that path is unchanged.
-    if (managed) {
-        if (force) await stopCamoufox();
-        return CAMOUFOX_ENDPOINT;
-    }
+    if (managed) return getManagedEndpoint(req, force);
     return endpoint;
 }
 
@@ -3249,7 +2957,7 @@ function registerJanitoraiBrowserRoutes(router) {
                         : 'Login did not produce a session. Wrong credentials, or a captcha needs solving in that browser.');
                 }
                 return { session: cookie };
-            }, req);
+            });
             res.json({ ok: true, ...result });
         } catch (err) {
             console.warn('[cl-helper] JanitorAI browser login failed:', err.message);
@@ -3297,7 +3005,7 @@ function registerJanitoraiBrowserRoutes(router) {
         }
 
         try {
-            const warm = await getWarmPage(await resolveBrowserEndpoint(req), req);
+            const warm = await getWarmPage(await resolveBrowserEndpoint(req));
             const out = await warm.page.evaluate(`(async () => {
                 const h = { Accept: 'application/json' };
                 ${token ? `h.Authorization = 'Bearer ' + ${JSON.stringify(token)};` : ''}
@@ -3359,7 +3067,7 @@ function registerJanitoraiBrowserRoutes(router) {
                 if (!token) throw new Error('This definition is hidden, so it needs a JanitorAI account. Sign in under Settings > Online > JanitorAI.');
 
                 return await extractHiddenDefinition(page, token, detail);
-            }, req);
+            });
             res.json({ ok: true, ...result });
         } catch (err) {
             console.warn('[cl-helper] JanitorAI extract failed:', err.message);
