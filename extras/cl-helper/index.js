@@ -2398,6 +2398,50 @@ class CamoufoxPage {
         return this.client.context.cookies(urls);
     }
 
+    /**
+     * Shim for the handful of raw CDP sends the routes still make (cookie writes, reload).
+     * Playwright exposes no generic CDP channel for Firefox, so each method is mapped by hand and
+     * anything unmapped throws loudly rather than silently doing nothing.
+     */
+    async send(method, params = {}) {
+        switch (method) {
+            case 'Page.reload':
+                await this.page.reload({ timeout: CDP_NAV_TIMEOUT });
+                return {};
+            case 'Network.setCookie': {
+                const { name, value, domain, path, expires, httpOnly, secure, sameSite } = params;
+                await this.client.context.addCookies([{
+                    name,
+                    value,
+                    domain,
+                    path: path || '/',
+                    ...(typeof expires === 'number' ? { expires } : {}),
+                    httpOnly: !!httpOnly,
+                    secure: !!secure,
+                    sameSite: ['Strict', 'Lax', 'None'].includes(sameSite) ? sameSite : 'Lax',
+                }]);
+                return { success: true };
+            }
+            case 'Network.deleteCookies':
+                await this.client.context.clearCookies({
+                    ...(params.name ? { name: params.name } : {}),
+                    ...(params.domain ? { domain: params.domain } : {}),
+                    ...(params.path ? { path: params.path } : {}),
+                });
+                return {};
+            case 'Network.getCookies':
+                return { cookies: await this.client.context.cookies(params.urls) };
+            // Page/Runtime/Network.enable are CDP domain toggles with no Playwright equivalent;
+            // the domains they gate are always on here, so accepting them is correct, not a stub.
+            case 'Page.enable':
+            case 'Runtime.enable':
+            case 'Network.enable':
+                return {};
+            default:
+                throw new Error(`Camoufox backend does not implement CDP method ${method}`);
+        }
+    }
+
     /** Same one-shot contract as the CDP version: arm before triggering, then wait(). */
     captureResponse(re, { timeout = 45000 } = {}) {
         let cancelled = false;
@@ -2444,30 +2488,9 @@ function janitoraiCall(method, path, body, token) {
     })()`;
 }
 
-const JANITORAI_COOKIE = 'sb-auth-auth-token';
-// Browsers cap a cookie near 4KB, so supabase splits a larger session across `<name>.0`, `.1`,
-// ... and then does NOT write the unsuffixed one. Whether a given account crosses the line
-// depends on its JWT claims, which is why an exact-name read works for some people and reports
-// a perfectly good session as missing for others.
-const JANITORAI_COOKIE_CHUNK_LIMIT = 3180;
-
-/** Join the session cookie back together, chunked or not. '' when absent. */
-function readJanitoraiCookie(cookies) {
-    const whole = cookies.find(c => c.name === JANITORAI_COOKIE)?.value;
-    if (whole) return whole;
-    const chunks = cookies
-        .map(c => ({ n: Number(new RegExp(`^${JANITORAI_COOKIE}\\.(\\d+)$`).exec(c.name)?.[1]), value: c.value }))
-        .filter(c => Number.isInteger(c.n))
-        .sort((a, b) => a.n - b.n);
-    // A gap means a chunk expired or was evicted; a partial join decodes to garbage, so treat
-    // the session as absent rather than handing back half a token.
-    if (!chunks.length || chunks.some((c, i) => c.n !== i)) return '';
-    return chunks.map(c => c.value).join('');
-}
-
 /** Pull the access token out of janitorai's supabase session cookie. '' when absent. */
 function readJanitoraiToken(cookies) {
-    const raw = readJanitoraiCookie(cookies);
+    const raw = cookies.find(c => c.name === 'sb-auth-auth-token')?.value;
     if (!raw) return { token: '', cookie: '' };
     try {
         const dec = decodeURIComponent(raw);
@@ -2587,35 +2610,17 @@ async function injectJanitoraiSession(page, accessToken, refreshToken) {
     };
     const value = 'base64-' + Buffer.from(JSON.stringify(session), 'utf8').toString('base64');
 
-    // Match supabase's own storage shape: one cookie when it fits, otherwise numbered chunks and
-    // no unsuffixed cookie. A single oversized cookie is dropped by the browser, which reads to
-    // the site as signed out.
-    const parts = [];
-    if (value.length <= JANITORAI_COOKIE_CHUNK_LIMIT) {
-        parts.push([JANITORAI_COOKIE, value]);
-    } else {
-        for (let i = 0, n = 0; i < value.length; i += JANITORAI_COOKIE_CHUNK_LIMIT, n++) {
-            parts.push([`${JANITORAI_COOKIE}.${n}`, value.slice(i, i + JANITORAI_COOKIE_CHUNK_LIMIT)]);
-        }
-    }
-
     try {
-        // Stale cookies from the other shape would otherwise win the read and pin a dead session.
-        for (const name of [JANITORAI_COOKIE, ...Array.from({ length: 8 }, (_, i) => `${JANITORAI_COOKIE}.${i}`)]) {
-            try { await page.send('Network.deleteCookies', { name, domain: 'janitorai.com', path: '/' }); } catch {}
-        }
-        for (const [name, chunk] of parts) {
-            await page.send('Network.setCookie', {
-                name,
-                value: chunk,
-                domain: 'janitorai.com',
-                path: '/',
-                secure: false,
-                httpOnly: false,
-                sameSite: 'Lax',
-                expires: expiresAt,
-            });
-        }
+        await page.send('Network.setCookie', {
+            name: 'sb-auth-auth-token',
+            value,
+            domain: 'janitorai.com',
+            path: '/',
+            secure: false,
+            httpOnly: false,
+            sameSite: 'Lax',
+            expires: expiresAt,
+        });
         return true;
     } catch {
         return false;
@@ -3133,11 +3138,6 @@ function registerJanitoraiBrowserRoutes(router) {
                 await page.goto(`${JANITORAI_ORIGIN}/login`, { timeout: CDP_NAV_TIMEOUT });
                 await new Promise(r => setTimeout(r, 6000));
 
-                // A browser that is already signed in has nothing to log into: janitorai serves
-                // no form, and re-driving one would only risk the session it already holds.
-                const existing = readJanitoraiToken(await page.cookies([JANITORAI_ORIGIN]));
-                if (existing.token) return { session: existing.cookie };
-
                 // React tracks value through its own descriptor, so a plain el.value = x is
                 // reverted on the next render; go through the native setter and fire input.
                 const filled = await page.evaluate(`
@@ -3153,14 +3153,7 @@ function registerJanitoraiBrowserRoutes(router) {
                         set(pw, ${JSON.stringify(password)});
                         return true;
                     })()`);
-                if (!filled) {
-                    // Which page we landed on is the whole diagnosis: a challenge, a block, or
-                    // the app itself all present as "no form" and need different answers.
-                    const title = String(await page.evaluate('document.title').catch(() => '') || '').slice(0, 80);
-                    throw new Error(CF_CHALLENGE_RE.test(title)
-                        ? `janitorai.com answered the login page with "${title}" instead of the form. Cloudflare is challenging or blocking this browser; run the connection test, and if it passes, try again in a few minutes.`
-                        : `Could not find the login form on janitorai.com (the page was "${title || 'untitled'}").`);
-                }
+                if (!filled) throw new Error('Could not find the login form on janitorai.com');
 
                 await new Promise(r => setTimeout(r, 2500));
                 await page.evaluate(`
@@ -3172,15 +3165,9 @@ function registerJanitoraiBrowserRoutes(router) {
                     })()`);
                 await new Promise(r => setTimeout(r, 13000));
 
-                const after = await page.cookies([JANITORAI_ORIGIN]);
-                const { token, cookie } = readJanitoraiToken(after);
+                const { token, cookie } = readJanitoraiToken(await page.cookies([JANITORAI_ORIGIN]));
                 if (!token) {
-                    // Naming the session cookies we can see separates "the sign-in was refused"
-                    // from "a session exists but we could not read it".
-                    const seen = after.map(c => c.name).filter(n => n.startsWith(JANITORAI_COOKIE));
-                    throw new Error(seen.length
-                        ? `Signed in, but the session cookie could not be read (${seen.join(', ')}). Please report this.`
-                        : 'Login did not produce a session. Wrong credentials, or a captcha needs solving in that browser.');
+                    throw new Error('Login did not produce a session. Wrong credentials, or a captcha needs solving in that browser.');
                 }
                 return { session: cookie };
             }, req);
