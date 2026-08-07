@@ -1,0 +1,14 @@
+{
+    "name": "ja-extract",
+    "version": "1.0.0",
+    "description": "Batch-extract JanitorAI character definitions to V2 character cards. No browser, no SillyTavern.",
+    "bin": { "ja-extract": "./ja-extract.js" },
+    "main": "ja-extract.js",
+    "type": "module",
+    "engines": {
+        "node": ">=22.15.0"
+    },
+    "dependencies": {
+        "impit": "^0.14.3"
+    }
+}
