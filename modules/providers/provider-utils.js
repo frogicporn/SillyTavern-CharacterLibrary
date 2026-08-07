@@ -718,6 +718,7 @@ export async function importFromPng({
     file = null;
 
     const csrfToken = api.getCSRFToken?.();
+    console.log('[Import][debug] POST /api/characters/import csrfLen=' + (csrfToken || '').length);
     const importResponse = await fetch('/api/characters/import', {
         method: 'POST',
         headers: { 'X-CSRF-Token': csrfToken },
@@ -726,6 +727,7 @@ export async function importFromPng({
     formData = null;
 
     const responseText = await importResponse.text();
+    console.log('[Import][debug] /api/characters/import -> ' + importResponse.status + ' body=' + responseText.slice(0, 200));
     if (!importResponse.ok) throw new Error(`Import error: ${responseText}`);
 
     let result;

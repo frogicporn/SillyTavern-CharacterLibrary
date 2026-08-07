@@ -19,6 +19,7 @@ import {
     resolveSaucepanImageUrl,
     fetchSaucepanCompanion,
     submitSaucepanExtraction,
+    submitSaucepanLockedExtraction,
     buildV2FromSaucepan,
     hitFromCompanion,
     saucepanCompanionUrl,
@@ -403,7 +404,34 @@ class SaucepanProvider extends ProviderBase {
                 hit = hitFromCompanion(companion, charId);
             }
 
-            const extractResult = await submitSaucepanExtraction(companionUrl, { allowPartial: !!options.allowPartial });
+            // Extraction, in preference order:
+            //   1. a result the preview already recovered (options.recoveredExtract), else
+            //   2. native extraction (works for open cards; returns greetings + a locked body),
+            //   3. if that came back locked, recover the body via the custom-provider path and merge.
+            // Doing (3) here (not only in the preview) makes import self-heal for the URL-paste path
+            // and for any case where the preview's stashed result did not reach us.
+            let extractResult = options.recoveredExtract || null;
+            if (!extractResult) {
+                const native = await submitSaucepanExtraction(companionUrl, { allowPartial: true });
+                if (native.success && native.assembled?.['Companion Core']) {
+                    extractResult = native;                       // open card, body present
+                } else if (options.allowPartial) {
+                    extractResult = native;                       // user chose an explicit partial import
+                } else {
+                    // Locked body: recover it and merge the (unlocked) greetings back in.
+                    const rec = await submitSaucepanLockedExtraction(charId);
+                    if (!rec?.ok || !rec.definition) {
+                        throw new Error(rec?.error || native.error || 'Could not recover the locked definition');
+                    }
+                    extractResult = {
+                        success: true,
+                        assembled: { ...(native.success ? native.assembled : {}), 'Companion Core': rec.definition },
+                        greetings: native.success ? native.greetings : [],
+                        profileDescription: native.profileDescription || '',
+                        partial: false,
+                    };
+                }
+            }
             if (!extractResult.success) {
                 throw new Error(extractResult.error || 'Saucepan extraction failed');
             }

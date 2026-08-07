@@ -27,6 +27,8 @@ import {
     fetchSaucepanCompanion,
     fetchSaucepanFandoms,
     fetchSaucepanV2Card,
+    submitSaucepanLockedExtraction,
+    submitSaucepanExtraction,
     hasSaucepanToken,
     resolveSaucepanImageUrl,
     saucepanCdnUrl,
@@ -1179,7 +1181,7 @@ function renderTokenCTA({ locked = false } = {}) {
     setImportButtonState('auth');
 }
 
-function renderExtractionUnavailable({ locked = false } = {}) {
+function renderExtractionUnavailable({ locked = false, companion = null } = {}) {
     for (const id of [
         'saucepanCharScenarioSection',
         'saucepanCharFirstMsgSection',
@@ -1192,6 +1194,9 @@ function renderExtractionUnavailable({ locked = false } = {}) {
     const section = document.getElementById('saucepanCharDescriptionSection');
     const el = document.getElementById('saucepanCharDescription');
     if (section) section.style.display = 'block';
+    // Locked cards whose creator left custom providers enabled can be recovered through the
+    // provider-capture path; the rest stay unavailable.
+    const canProxyExtract = locked && companion?.providers_profile === 'custom_and_vetted';
     if (el) {
         el.innerHTML = locked ? `
             <div class="saucepan-modal-extract-cta">
@@ -1199,7 +1204,13 @@ function renderExtractionUnavailable({ locked = false } = {}) {
                     <i class="fa-solid fa-lock saucepan-modal-extract-icon"></i>
                 </div>
                 <p class="saucepan-modal-extract-message">This companion's definition is locked by its creator.</p>
-                <p class="saucepan-modal-extract-hint">Native extraction cannot retrieve the character body. You can still import an incomplete card: portrait, greetings, tags, and the public blurb, with no definition.</p>
+                <p class="saucepan-modal-extract-hint">${canProxyExtract
+                    ? 'The creator left custom providers enabled, so the definition can still be recovered. This takes a few seconds while a capture channel is set up.'
+                    : 'Native extraction cannot retrieve the character body. You can still import an incomplete card: portrait, greetings, tags, and the public blurb, with no definition.'}</p>
+                ${canProxyExtract ? `
+                <button class="action-btn primary saucepan-modal-extract-btn" id="saucepanProxyExtractBtn">
+                    <i class="fa-solid fa-unlock"></i> Extract definition
+                </button>` : ''}
                 <button class="action-btn secondary saucepan-modal-extract-btn" id="saucepanPartialImportBtn">
                     <i class="fa-solid fa-download"></i> Import anyway
                 </button>
@@ -1212,6 +1223,8 @@ function renderExtractionUnavailable({ locked = false } = {}) {
                 <p class="saucepan-modal-extract-message">Could not load this character's definition.</p>
             </div>
         `;
+        el.querySelector('#saucepanProxyExtractBtn')?.addEventListener('click',
+            () => recoverSaucepanDefinitionIntoPreview(companion));
         el.querySelector('#saucepanPartialImportBtn')?.addEventListener('click', async () => {
             if (!saucepanSelectedChar) return;
             const btn = document.getElementById('saucepanPartialImportBtn');
@@ -1225,6 +1238,55 @@ function renderExtractionUnavailable({ locked = false } = {}) {
         });
     }
     setImportButtonState('unavailable');
+}
+
+/**
+ * Recover a locked companion's definition through cl-helper's custom-provider capture and paint it
+ * into the preview. Guards against the user moving to another card mid-extraction.
+ */
+async function recoverSaucepanDefinitionIntoPreview(companion) {
+    const hit = saucepanSelectedChar;
+    const charId = getCharId(hit);
+    const companionId = companion?.id || charId;
+    if (!companionId) return;
+    const token = saucepanDetailFetchToken;
+    const btn = document.getElementById('saucepanProxyExtractBtn');
+    if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Extracting...'; }
+    try {
+        const rec = await submitSaucepanLockedExtraction(String(companionId));
+        if (token !== saucepanDetailFetchToken) return;   // user switched cards
+        if (!rec?.ok || !rec.definition) throw new Error(rec?.error || 'Nothing came back');
+
+        // Greetings and the public profile are NOT locked, so the normal extraction still returns
+        // them for a locked card (it just lacks the body). Merge the recovered definition in as the
+        // Companion Core so both the preview and a subsequent import get a complete card.
+        const pub = await submitSaucepanExtraction(saucepanCompanionUrl(companionId), { allowPartial: true })
+            .catch(() => ({ success: false }));
+        if (token !== saucepanDetailFetchToken) return;
+        const greetings = (pub?.success && Array.isArray(pub.greetings)) ? pub.greetings : [];
+        const extract = {
+            success: true,
+            assembled: { ...(pub?.success ? pub.assembled : {}), 'Companion Core': rec.definition },
+            greetings,
+            profileDescription: pub?.profileDescription || '',
+            partial: false,
+        };
+        const name = hit?.name || 'Unknown';
+        if (saucepanSelectedChar && getCharId(saucepanSelectedChar) === charId) {
+            saucepanSelectedChar._recoveredDefinition = rec.definition;
+            saucepanSelectedChar._recoveredExtract = extract;
+        }
+        paintBodySectionSecure('saucepanCharDescriptionSection', 'saucepanCharDescription', rec.definition, name);
+        const greetTexts = greetings.map(g => g?.text || '').filter(Boolean);
+        paintBodySection('saucepanCharFirstMsgSection', 'saucepanCharFirstMsg', greetTexts[0] || '', name);
+        renderAltGreetings(greetTexts.slice(1), name);
+        setImportButtonState(isCharInLocalLibrary(hit) ? 'inLibrary' : 'import', hit);
+        showToast(`Definition recovered${greetTexts.length ? ` (+${greetTexts.length} greeting${greetTexts.length === 1 ? '' : 's'})` : ''}`, 'success');
+    } catch (err) {
+        if (token !== saucepanDetailFetchToken) return;
+        showToast(`Could not extract this definition: ${err.message}`, 'error', 8000);
+        if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fa-solid fa-unlock"></i> Extract definition'; }
+    }
 }
 
 function renderSaucepanGallery(portraits) {
@@ -1315,7 +1377,7 @@ async function fetchAndPopulateDetails(hit, token) {
         if (defLoading) defLoading.style.display = 'none';
 
         if (!v2Card?.data) {
-            renderExtractionUnavailable({ locked: lockedDef });
+            renderExtractionUnavailable({ locked: lockedDef, companion });
             return;
         }
 
@@ -1508,8 +1570,12 @@ async function importSaucepanCharacter(hit, opts = {}) {
         const provider = CoreAPI.getProvider('saucepan');
         if (!provider?.importCharacter) throw new Error('Saucepan provider not available');
 
-        // The provider re-runs native extraction and downloads the avatar.
-        const result = await provider.importCharacter(charId, hit, { inheritedGalleryId, allowPartial: !!opts.allowPartial });
+        // A locked card recovered via the proxy path carries its definition + greetings on the hit;
+        // hand that to the provider so it skips its own (locked-out) native extraction.
+        const result = await provider.importCharacter(charId, hit, {
+            inheritedGalleryId, allowPartial: !!opts.allowPartial,
+            recoveredExtract: hit._recoveredExtract || null,
+        });
         if (!result.success) throw new Error(result.error || 'Import failed');
 
         const mediaUrls = result.embeddedMediaUrls || [];
@@ -1551,7 +1617,7 @@ async function importSaucepanCharacter(hit, opts = {}) {
             markImported: () => markCardAsImported(charId),
         });
     } catch (err) {
-        console.error('[SaucepanBrowse] Import failed:', err);
+        console.error('[SaucepanBrowse] Import failed:', err?.message, '\nSTACK:', err?.stack);
         showToast(`Import failed: ${err.message}`, 'error');
         setImportButtonState(failState, hit);
     }

@@ -160,6 +160,26 @@ export async function saucepanLogin(handle, password) {
 }
 
 /**
+ * Recover a locked companion's definition via cl-helper's custom-provider capture.
+ * First call warms a tunnel + provider (slow); later calls reuse it, so the timeout is generous.
+ * @returns {Promise<{ok: boolean, definition?: string, providersProfile?: string, error?: string}>}
+ */
+export async function submitSaucepanLockedExtraction(companionId) {
+    try {
+        const resp = await _apiRequest(`${CL_HELPER_PLUGIN_BASE}/saucepan-extract-definition`, 'POST',
+            { companionId }, { signal: AbortSignal.timeout(120000) });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok || data?.ok === false) {
+            return { ok: false, providersProfile: data?.providersProfile, error: data?.error || `cl-helper returned HTTP ${resp.status}` };
+        }
+        return data;
+    } catch (e) {
+        if (e?.name === 'TimeoutError' || e?.name === 'AbortError') return { ok: false, error: 'The extraction did not finish in time (the tunnel may not have come up). Try again.' };
+        return { ok: false, error: 'Could not reach cl-helper. Is the plugin installed and SillyTavern restarted?' };
+    }
+}
+
+/**
  * Push a Bearer token into cl-helper's in-memory store (proxy auth).
  * @returns {Promise<{ok: boolean, error?: string}>}
  */
