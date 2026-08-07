@@ -2200,6 +2200,78 @@ class CdpPage {
 }
 
 /** Build an in-page fetch against janitorai, as an expression string for Runtime.evaluate. */
+// =============================================================================
+// Direct transport (impit)
+// =============================================================================
+//
+// janitorai's edge rejects a normal node fetch on the TLS fingerprint alone -- a plain request is
+// 403ed even carrying a valid cf_clearance. impit presents a real Firefox handshake, which the
+// edge accepts, so /hampter/* and /generateAlpha can be called straight from the server with just
+// the bearer token: no page, no cookies, no clearance.
+//
+// This is a transport, not a replacement for the browser. It is the fast path; jaFetch falls back
+// to the in-page fetch whenever the edge refuses it, because "impit's fingerprint currently
+// passes" is an arms-race property, not a contract.
+
+const JA_IMPERSONATE = 'firefox133';
+const JA_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0';
+let _impit = null;
+let _impitDead = false;
+
+async function getImpit() {
+    if (_impitDead) return null;
+    if (_impit) return _impit;
+    try {
+        const { Impit } = await import('impit');
+        _impit = new Impit({ browser: JA_IMPERSONATE });
+    } catch (e) {
+        // Missing or unloadable native binding: fall back for the whole process, quietly.
+        console.warn(`[cl-helper] impit unavailable (${e.message}); janitorai calls will use the browser.`);
+        _impitDead = true;
+        return null;
+    }
+    return _impit;
+}
+
+/**
+ * One janitorai API call, preferring the direct transport and falling back to `page` on refusal.
+ * Returns the same { status, data, text } shape janitoraiCall's in-page fetch resolves to, so
+ * call sites do not care which path served them.
+ * @param {Object|null} page - fallback page; when null a refusal is surfaced as-is
+ */
+async function jaFetch(method, path, body, token, page, { accept } = {}) {
+    const impit = await getImpit();
+    if (impit) {
+        try {
+            const headers = {
+                accept: accept || 'application/json, text/plain, */*',
+                'user-agent': JA_UA,
+                referer: `${JANITORAI_ORIGIN}/`,
+                'x-app-version': '9.9.999',
+            };
+            if (token) headers.authorization = `Bearer ${token}`;
+            if (body) headers['content-type'] = 'application/json';
+            const resp = await impit.fetch(`${JANITORAI_ORIGIN}${path}`, {
+                method, headers, ...(body ? { body: JSON.stringify(body) } : {}),
+            });
+            // 403 here is the edge refusing the transport, not the API refusing the caller: the
+            // API answers 401/404/500 in JSON. Retry through the browser rather than surfacing it.
+            if (resp.status !== 403) {
+                const t = await resp.text();
+                let d = null;
+                try { d = JSON.parse(t); } catch { /* non-JSON body */ }
+                return { status: resp.status, data: d, text: d ? null : t };
+            }
+            if (page) console.warn('[cl-helper] janitorai edge refused the direct transport; using the browser.');
+        } catch (e) {
+            if (!page) throw e;
+            console.warn(`[cl-helper] direct transport failed (${e.message}); using the browser.`);
+        }
+    }
+    if (!page) throw new Error('janitorai refused the direct request and no browser was available.');
+    return page.evaluate(janitoraiCall(method, path, body, token));
+}
+
 function janitoraiCall(method, path, body, token) {
     const headers = { Accept: 'application/json' };
     if (token) headers.Authorization = `Bearer ${token}`;
@@ -3056,7 +3128,7 @@ function registerJanitoraiBrowserRoutes(router) {
                     await injectJanitoraiSession(page, clientToken, refreshToken);
                 }
 
-                const detailRes = await page.evaluate(janitoraiCall('GET', `/hampter/characters/${characterId}`, null, token));
+                const detailRes = await jaFetch('GET', `/hampter/characters/${characterId}`, null, token, page);
                 if (detailRes.status === 404) throw new Error('That character no longer exists on JanitorAI.');
                 if (detailRes.status >= 400 || !detailRes.data) {
                     throw new Error(`JanitorAI returned HTTP ${detailRes.status} for that character.`);
@@ -3131,7 +3203,12 @@ function promptErrorSnippet(body) {
  * persona name into the prompt, so a sentinel round-trips back to the macro exactly.
  */
 async function extractHiddenDefinition(page, token, detail) {
-    const snapshot = await page.evaluate(janitoraiCall('GET', '/hampter/api-settings', null, token));
+    // Timings are logged because this path exists to be fast; a regression here is silent
+    // otherwise (it still returns the right definition, just slowly).
+    const _t0 = Date.now();
+    const _marks = [];
+    const _mark = (label) => _marks.push(`${label} ${Date.now() - _t0}ms`);
+    const snapshot = await jaFetch('GET', '/hampter/api-settings', null, token, page);
     const prev = snapshot.data?.legacy_config || snapshot.data?.settings || {};
     const prevGeneration = prev.generation_settings && typeof prev.generation_settings === 'object'
         ? prev.generation_settings
@@ -3150,15 +3227,15 @@ async function extractHiddenDefinition(page, token, detail) {
     let personaId = null;
     let chatId = null;
     try {
-        const persona = await page.evaluate(janitoraiCall('POST', '/hampter/personas', {
+        const persona = await jaFetch('POST', '/hampter/personas', {
             appearance: '', avatar: '', groupId: null, name: userSentinel, pronouns: null,
-        }, token));
+        }, token, page);
         personaId = persona.data?.id || null;
 
         // Ephemeral range: nothing listens there by convention, so this cant reach a local
         // model server the user is running on a well-known port.
         const deadPort = 49152 + Math.floor(Math.random() * 16384);
-        const created = await page.evaluate(janitoraiCall('POST', '/hampter/api-settings/proxy-configs', {
+        const created = await jaFetch('POST', '/hampter/api-settings/proxy-configs', {
             // Rejected server-side once used, so it cannot be a constant.
             client_id: randomUUID(),
             name: randomHex(8),
@@ -3167,48 +3244,72 @@ async function extractHiddenDefinition(page, token, detail) {
             // Only has to be non-blank; the request is never meant to arrive anywhere.
             api_key: `sk-${randomHex(20)}`,
             prompt_id: null,
-        }, token));
+        }, token, page);
+        _mark('setup');
         const cfgs = created.data?.proxy_configs || [];
         proxyId = cfgs.length ? cfgs[cfgs.length - 1].id : null;
         if (!proxyId) throw new Error(`JanitorAI rejected the temporary preset (HTTP ${created.status})`);
 
-        await page.evaluate(janitoraiCall('PATCH', '/hampter/api-settings', {
+        await jaFetch('PATCH', '/hampter/api-settings', {
             source: 'proxy',
             [selected.key || SELECTED_PRESET_KEYS[0]]: proxyId,
             // A bounded context makes the server rewrite the prompt, losing the section
             // boundaries the definition is read from.
             generation_settings: { context_length: 0 },
-        }, token));
+        }, token, page);
 
-        const chat = await page.evaluate(janitoraiCall('POST', '/hampter/chats',
-            personaId ? { character_id: detail.id, persona_id: personaId } : { character_id: detail.id }, token));
+        const chat = await jaFetch('POST', '/hampter/chats',
+            personaId ? { character_id: detail.id, persona_id: personaId } : { character_id: detail.id }, token, page);
+        _mark('chat');
         chatId = chat.data?.id;
         if (!chatId) throw new Error(`Could not open a chat with that character (HTTP ${chat.status})`);
 
-        const capture = page.captureResponse(/generateAlpha/, { timeout: 45000 });
-        try {
-            await page.goto(`${JANITORAI_ORIGIN}/chats/${chatId}`, { timeout: CDP_NAV_TIMEOUT });
-            await new Promise(r => setTimeout(r, 8000));
+        {
+            // The prompt is only assembled once the chat has a user turn, so "hi" still has to be
+            // sent -- but as the API call the composer would have made, not by driving the DOM.
+            // Calling generateAlpha ourselves also means its response IS the payload, so nothing
+            // has to be intercepted.
+            const sent = await jaFetch('POST', `/hampter/chats/${chatId}/messages`, {
+                is_bot: false, is_main: true, message: 'hi',
+                metadata: { persona_id: personaId || null },
+                character_id: detail.id, chat_id: chatId,
+            }, token, page);
+            if (sent.status >= 400) throw new Error(`Could not send the priming message (HTTP ${sent.status})`);
 
-            // The composer can be in "press button to send" mode, where Enter only inserts a
-            // linebreak and nothing is sent. Click the send control; Enter is the fallback.
-            const sent = await page.evaluate(`
-                (() => {
-                    const ta = document.querySelector('textarea');
-                    if (!ta) return { ok: false, why: 'no composer' };
-                    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
-                    setter.call(ta, 'hi');
-                    ta.dispatchEvent(new Event('input', { bubbles: true }));
-                    const form = ta.closest('form') || ta.parentElement?.parentElement || document.body;
-                    const btn = [...form.querySelectorAll('button')].reverse()
-                        .find(b => !b.disabled && (/send/i.test(b.getAttribute('aria-label') || '') || b.querySelector('svg')));
-                    if (!btn) return { ok: false, why: 'no send control' };
-                    btn.click();
-                    return { ok: true };
-                })()`);
-            if (!sent?.ok) throw new Error(`Could not send the priming message (${sent?.why || 'unknown'})`);
+            // Read the state back rather than assembling it: janitorai stamps ids and timestamps
+            // on both turns, and generateAlpha echoes them verbatim.
+            const state = await jaFetch('GET', `/hampter/chats/${chatId}`, null, token, page);
+            if (!state.data?.chat || !Array.isArray(state.data?.chatMessages)) {
+                throw new Error(`Could not read the chat back (HTTP ${state.status})`);
+            }
 
-            const body = await capture.wait();
+            const gen = await jaFetch('POST', '/generateAlpha', {
+                chat: state.data.chat,
+                chatMessages: state.data.chatMessages,
+                clientPlatform: 'web',
+                forcedPromptGenerationCacheRefetch: { character: false, chat: false, profile: true, script: false },
+                generateMode: 'NEW',
+                generateType: 'CHAT',
+                // Named with the sentinel, not the real profile: janitorai substitutes a user name
+                // into the prompt, and whichever of these the server reads, the sentinel is what
+                // comes back -- which is exactly what restoreJanitoraiMacros turns into {{user}}.
+                profile: { id: state.data.chat.user_id, name: userSentinel, user_name: userSentinel },
+                profiles: [{ id: state.data.chat.user_id, name: userSentinel, type: 'profile', user_name: userSentinel }],
+                // Mirrors what was just PATCHed onto the account. The server reads the stored
+                // settings for proxy mode, but a partial userConfig here is a 500, not a default.
+                userConfig: {
+                    allow_mobile_nsfw: false,
+                    api: 'proxy',
+                    claudeApiKey: null,
+                    generation_settings: { context_length: 0, enable_reasoning: false, enable_reasoning_chat: false,
+                        enable_router_temperature: false, enable_short_responses: false, max_new_token: 0,
+                        prefill_enabled: false, prefill_text: '', temperature: 1 },
+                    janitor_router_enabled: false, llm_prompt: '', openAIKey: null,
+                    reverseProxyKey: '', text_streaming: false,
+                },
+            }, token, page, { accept: 'text/event-stream' });
+            _mark('generateAlpha');
+            const body = gen.data ? JSON.stringify(gen.data) : (gen.text || '');
             if (!body) throw new Error('JanitorAI never assembled the prompt. It may be rate limiting; try again shortly.');
 
             // The payload is the whole chat request, not just the definition:
@@ -3240,57 +3341,27 @@ async function extractHiddenDefinition(page, token, detail) {
                 firstMessage: firstMessage ? restoreJanitoraiMacros(firstMessage, { userSentinel, detail }) : '',
                 extracted: true,
             };
-        } finally {
-            capture.cancel();
         }
     } finally {
+        _mark('done');
+        console.log(`[cl-helper] janitorai extract: ${_marks.join(' | ')}`);
         // The chat exists only so janitorai will assemble the prompt; it is a side effect of the
         // capture, not a result. Leaving it behind puts one dead entry in the account's chat list
         // per extraction. Removed before the persona it references.
-        if (chatId) {
-            await page.evaluate(`
-                (async () => {
-                    try {
-                        const r = await fetch('/hampter/chats/${chatId}', {
-                            method: 'DELETE', credentials: 'include',
-                            headers: { Authorization: 'Bearer ' + ${JSON.stringify(token)} },
-                        });
-                        return r.status;
-                    } catch { return 0; }
-                })()`).catch(() => {});
-        }
-        if (personaId) {
-            await page.evaluate(`
-                (async () => {
-                    try {
-                        const r = await fetch('/hampter/personas/${personaId}', {
-                            method: 'DELETE', credentials: 'include',
-                            headers: { Authorization: 'Bearer ' + ${JSON.stringify(token)} },
-                        });
-                        return r.status;
-                    } catch { return 0; }
-                })()`).catch(() => {});
-        }
-        if (proxyId) {
-            // DELETE must carry no Content-Type: an empty body with a json content-type 400s.
-            await page.evaluate(`
-                (async () => {
-                    try {
-                        const r = await fetch('/hampter/api-settings/proxy-configs/${proxyId}', {
-                            method: 'DELETE', credentials: 'include',
-                            headers: { Authorization: 'Bearer ' + ${JSON.stringify(token)} },
-                        });
-                        return r.status;
-                    } catch { return 0; }
-                })()`).catch(() => {});
-        }
-        await page.evaluate(janitoraiCall('PATCH', '/hampter/api-settings', {
+        // Best effort, and deliberately not aborting each other: a failed persona delete must not
+        // leave the proxy config and the account's settings behind too.
+        if (chatId) await jaFetch('DELETE', `/hampter/chats/${chatId}`, null, token, page).catch(() => {});
+        if (personaId) await jaFetch('DELETE', `/hampter/personas/${personaId}`, null, token, page).catch(() => {});
+        // DELETE must carry no Content-Type: an empty body with a json content-type 400s. jaFetch
+        // only sets it when there is a body, so passing null is what keeps that true.
+        if (proxyId) await jaFetch('DELETE', `/hampter/api-settings/proxy-configs/${proxyId}`, null, token, page).catch(() => {});
+        await jaFetch('PATCH', '/hampter/api-settings', {
             source: prevSource,
             // Null is meaningful here (nothing was selected), so send it whenever the key was found.
             ...(selected.key ? { [selected.key]: selected.value } : {}),
             // Replayed wholesale; rebuilding it would swap tuning values we dont model for defaults.
             ...(prevGeneration ? { generation_settings: prevGeneration } : {}),
-        }, token)).catch(() => {});
+        }, token, page).catch(() => {});
     }
 }
 

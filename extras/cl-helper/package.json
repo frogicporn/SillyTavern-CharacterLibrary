@@ -1,10 +1,13 @@
 {
     "name": "cl-helper",
-    "version": "1.9.1-headful.1",
+    "version": "1.9.1-fastextract.1",
     "description": "Server-side helper plugin for SillyTavern Character Library. Provides auth proxying for providers that require custom request headers.",
     "main": "index.js",
     "type": "module",
     "engines": {
         "node": ">=22.15.0"
+    },
+    "dependencies": {
+        "impit": "^0.14.3"
     }
 }
