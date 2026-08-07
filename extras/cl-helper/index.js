@@ -3258,6 +3258,16 @@ async function extractHiddenDefinition(page, token, detail) {
             generation_settings: { context_length: 0 },
         }, token, page);
 
+        // Read the account back rather than hand-building userConfig for generateAlpha. The web
+        // client sends whatever the account currently holds, and the server validates it as a
+        // whole: a plausible-looking config assembled here is a 500, not a set of defaults. This
+        // is also self-correcting, since it carries whatever fields janitorai adds later.
+        const live = await jaFetch('GET', '/hampter/api-settings', null, token, page);
+        const liveConfig = live.data?.legacy_config || live.data?.settings || null;
+        if (!liveConfig || typeof liveConfig !== 'object') {
+            throw new Error(`Could not read back the temporary settings (HTTP ${live.status})`);
+        }
+
         const chat = await jaFetch('POST', '/hampter/chats',
             personaId ? { character_id: detail.id, persona_id: personaId } : { character_id: detail.id }, token, page);
         _mark('chat');
@@ -3295,18 +3305,9 @@ async function extractHiddenDefinition(page, token, detail) {
                 // comes back -- which is exactly what restoreJanitoraiMacros turns into {{user}}.
                 profile: { id: state.data.chat.user_id, name: userSentinel, user_name: userSentinel },
                 profiles: [{ id: state.data.chat.user_id, name: userSentinel, type: 'profile', user_name: userSentinel }],
-                // Mirrors what was just PATCHed onto the account. The server reads the stored
-                // settings for proxy mode, but a partial userConfig here is a 500, not a default.
-                userConfig: {
-                    allow_mobile_nsfw: false,
-                    api: 'proxy',
-                    claudeApiKey: null,
-                    generation_settings: { context_length: 0, enable_reasoning: false, enable_reasoning_chat: false,
-                        enable_router_temperature: false, enable_short_responses: false, max_new_token: 0,
-                        prefill_enabled: false, prefill_text: '', temperature: 1 },
-                    janitor_router_enabled: false, llm_prompt: '', openAIKey: null,
-                    reverseProxyKey: '', text_streaming: false,
-                },
+                // The account's own config, read back after the PATCH. Streaming is forced off
+                // because we want the assembled prompt as one body, not an SSE trickle.
+                userConfig: { ...liveConfig, text_streaming: false },
             }, token, page, { accept: 'text/event-stream' });
             _mark('generateAlpha');
             const body = gen.data ? JSON.stringify(gen.data) : (gen.text || '');
