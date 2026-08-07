@@ -2214,6 +2214,11 @@ class CdpPage {
 // passes" is an arms-race property, not a contract.
 
 const JA_IMPERSONATE = 'firefox133';
+const JA_RATE_LIMIT_RETRIES = 3;
+const JA_RATE_LIMIT_BASE_MS = 1000;
+// Retry-After is honoured, but not to the point of parking a request for minutes; past this the
+// caller is better told to try again than left hanging.
+const JA_RATE_LIMIT_MAX_WAIT_MS = 15000;
 const JA_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0';
 let _impit = null;
 let _impitDead = false;
@@ -2240,6 +2245,24 @@ async function getImpit() {
  * @param {Object|null} page - fallback page; when null a refusal is surfaced as-is
  */
 async function jaFetch(method, path, body, token, page, { accept } = {}) {
+    // A 429 means the request was never processed, so replaying it is safe even for a POST. The
+    // retry wraps the whole call rather than the direct transport alone: the browser fallback is
+    // the slower path and so the likelier one to be told to slow down.
+    for (let attempt = 0; ; attempt++) {
+        const r = await jaFetchOnce(method, path, body, token, page, accept);
+        if (r.status !== 429 || attempt >= JA_RATE_LIMIT_RETRIES) return r;
+        const after = Number(r.retryAfter);
+        const waitMs = Number.isFinite(after) && after > 0
+            ? Math.min(after * 1000, JA_RATE_LIMIT_MAX_WAIT_MS)
+            : JA_RATE_LIMIT_BASE_MS * (2 ** attempt);
+        console.warn(`[cl-helper] janitorai rate limited ${path}; retrying in ${waitMs}ms.`);
+        await new Promise(r2 => setTimeout(r2, waitMs));
+    }
+}
+
+/** One attempt down whichever transport is available. Carries `retryAfter` so the caller can honour
+ *  it without caring which path served the response. */
+async function jaFetchOnce(method, path, body, token, page, accept) {
     // `page` may be a provider so the caller can avoid starting a browser it never needs; it is
     // only invoked on the fallback path.
     const getPage = () => (typeof page === 'function' ? page() : page);
@@ -2263,7 +2286,7 @@ async function jaFetch(method, path, body, token, page, { accept } = {}) {
                 const t = await resp.text();
                 let d = null;
                 try { d = JSON.parse(t); } catch { /* non-JSON body */ }
-                return { status: resp.status, data: d, text: d ? null : t };
+                return { status: resp.status, data: d, text: d ? null : t, retryAfter: resp.headers?.get?.('retry-after') || '' };
             }
             console.warn('[cl-helper] janitorai edge refused the direct transport; using the browser.');
         } catch (e) {
@@ -2290,7 +2313,7 @@ function janitoraiCall(method, path, body, token) {
         const r = await fetch(${JSON.stringify(path)}, ${JSON.stringify(init)});
         const t = await r.text();
         let d = null; try { d = JSON.parse(t); } catch {}
-        return { status: r.status, data: d, text: d ? null : t.slice(0, 400) };
+        return { status: r.status, data: d, text: d ? null : t.slice(0, 400), retryAfter: r.headers.get('retry-after') || '' };
     })()`;
 }
 
@@ -3216,64 +3239,107 @@ function promptErrorSnippet(body) {
     return flat ? flat.slice(0, 200) : 'the response was empty';
 }
 
+// =============================================================================
+// The extraction window
+// =============================================================================
+//
+// Extraction works by putting the *account* into proxy mode with an unbounded context, so the
+// mutated state is global rather than per character. Doing that once per character has two costs:
+// four setup calls and two teardown calls per card, and -- worse -- two extractions that overlap
+// corrupt the account, because the second snapshots the first's mutated settings and later
+// restores them as if the user had chosen them.
+//
+// So the mutation is a refcounted lease. The first extraction opens the window, any others borrow
+// it, and it closes on an idle timer once the last one lets go. The timer is what makes this help
+// the batch paths: they extract strictly serially, so nothing would ever overlap, but each card
+// arrives well inside the idle gap and finds the window already open.
+
+const JA_WINDOW_IDLE_MS = 20000;
+// Kept outside the plugin directory so a self-update cannot delete a pending restore. extras/
+// ja-extract writes the same shape to the same path on purpose: either tool can heal an account the
+// other one crashed on, and they mutate the same settings in the same way.
+const JA_RESTORE_FILE = join(tmpdir(), 'cl-janitorai-restore.json');
+
+let _jaWindow = null;
+let _jaWindowIdle = null;
+let _jaWindowClosing = null;
+let _jaWindowGate = Promise.resolve();
+
 /**
- * The generateAlpha capture. Every account mutation is undone in the finally block. The persona
- * is named with a random sentinel rather than the macro itself: janitorai substitutes the
- * persona name into the prompt, so a sentinel round-trips back to the macro exactly.
+ * The pristine settings are written to disk before the first mutation and removed only once they
+ * are back on the account. Nothing else can tell a crashed run's leftovers apart from a choice the
+ * user made, and guessing wrong makes the sentinel settings permanent.
  */
-// `page` is a provider, not a page: nothing here needs a browser unless the direct transport is
-// refused, and resolving it eagerly would reintroduce the launch this path exists to avoid.
-async function extractHiddenDefinition(page, token, detail) {
-    // Timings are logged because this path exists to be fast; a regression here is silent
-    // otherwise (it still returns the right definition, just slowly).
-    const _t0 = Date.now();
-    const _marks = [];
-    const _mark = (label) => _marks.push(`${label} ${Date.now() - _t0}ms`);
+async function rememberPristine(state) {
+    try { await writeFile(JA_RESTORE_FILE, JSON.stringify(state), 'utf-8'); } catch {}
+}
+
+async function recallPristine() {
+    try { return JSON.parse(await readFile(JA_RESTORE_FILE, 'utf-8')); } catch { return null; }
+}
+
+async function openExtractionWindow(token, page) {
     const snapshot = await jaFetch('GET', '/hampter/api-settings', null, token, page);
     const prev = snapshot.data?.legacy_config || snapshot.data?.settings || {};
-    const prevGeneration = prev.generation_settings && typeof prev.generation_settings === 'object'
-        ? prev.generation_settings
-        : null;
-    const prevSource = prev.api || prev.source || 'janitor';
     const selected = resolveSelectedPresetKey(snapshot.data);
+    let pristine = {
+        source: prev.api || prev.source || 'janitor',
+        selectedKey: selected.key,
+        selectedValue: selected.value,
+        generation: prev.generation_settings && typeof prev.generation_settings === 'object'
+            ? prev.generation_settings
+            : null,
+    };
 
+    // context_length 0 is the sentinel this code sets and no usable value for chatting, so finding
+    // it live means a previous run died before restoring. Snapshotting it would hand it back as the
+    // user's own setting on the next close, which is how a survivable interruption turns permanent.
+    if (pristine.generation?.context_length === 0) {
+        const saved = await recallPristine();
+        if (!saved?.generation?.context_length) {
+            throw new Error('Your JanitorAI settings are still in extraction mode from an interrupted run, and the saved copy of your own settings is gone. Set your context length back in JanitorAI settings, then try again.');
+        }
+        console.warn('[cl-helper] janitorai settings were left in extraction mode; restoring the saved copy.');
+        // The crashed run's decoy preset outlives it and nothing else will ever reference it, so it
+        // would sit in the account's preset list forever, one per crash.
+        if (saved.proxyId) {
+            await jaFetch('DELETE', `/hampter/api-settings/proxy-configs/${saved.proxyId}`, null, token, page).catch(() => {});
+        }
+        pristine = { ...saved, proxyId: null };
+    }
     // Never override a context length we cannot put back; the user would inherit it in their chats.
-    if (typeof prevGeneration?.context_length !== 'number') {
+    if (typeof pristine.generation?.context_length !== 'number') {
         throw new Error('Could not read your JanitorAI generation settings, so nothing was changed. Open JanitorAI settings once in this browser and try again.');
     }
+    await rememberPristine(pristine);
 
-    // No fixed affix, so a persona left behind by a failed run reads as noise rather than a marker.
-    const userSentinel = randomHex(12).toUpperCase();
-    let proxyId = null;
-    let personaId = null;
-    let chatId = null;
+    // Ephemeral range: nothing listens there by convention, so this cant reach a local
+    // model server the user is running on a well-known port.
+    const deadPort = 49152 + Math.floor(Math.random() * 16384);
+    const created = await jaFetch('POST', '/hampter/api-settings/proxy-configs', {
+        // Rejected server-side once used, so it cannot be a constant.
+        client_id: randomUUID(),
+        name: randomHex(8),
+        model: 'gpt-4-turbo',
+        api_url: `http://127.0.0.1:${deadPort}/v1/chat/completions`,
+        // Only has to be non-blank; the request is never meant to arrive anywhere.
+        api_key: `sk-${randomHex(20)}`,
+        prompt_id: null,
+    }, token, page);
+    const cfgs = created.data?.proxy_configs || [];
+    const proxyId = cfgs.length ? cfgs[cfgs.length - 1].id : null;
+    if (!proxyId) throw new Error(`JanitorAI rejected the temporary preset (HTTP ${created.status})`);
+    // Re-written now that the decoy exists so a crash from here on leaves something able to clean it
+    // up. The settings had to be saved before this point, hence the second write rather than one.
+    await rememberPristine({ ...pristine, proxyId });
+
+    // Identifies the window in the extraction log; the same id on consecutive lines is what says
+    // the account setup was paid once rather than per character.
+    const win = { id: randomHex(3), token, page, proxyId, pristine, liveConfig: null, refs: 0 };
     try {
-        const persona = await jaFetch('POST', '/hampter/personas', {
-            appearance: '', avatar: '', groupId: null, name: userSentinel, pronouns: null,
-        }, token, page);
-        personaId = persona.data?.id || null;
-
-        // Ephemeral range: nothing listens there by convention, so this cant reach a local
-        // model server the user is running on a well-known port.
-        const deadPort = 49152 + Math.floor(Math.random() * 16384);
-        const created = await jaFetch('POST', '/hampter/api-settings/proxy-configs', {
-            // Rejected server-side once used, so it cannot be a constant.
-            client_id: randomUUID(),
-            name: randomHex(8),
-            model: 'gpt-4-turbo',
-            api_url: `http://127.0.0.1:${deadPort}/v1/chat/completions`,
-            // Only has to be non-blank; the request is never meant to arrive anywhere.
-            api_key: `sk-${randomHex(20)}`,
-            prompt_id: null,
-        }, token, page);
-        _mark('setup');
-        const cfgs = created.data?.proxy_configs || [];
-        proxyId = cfgs.length ? cfgs[cfgs.length - 1].id : null;
-        if (!proxyId) throw new Error(`JanitorAI rejected the temporary preset (HTTP ${created.status})`);
-
         await jaFetch('PATCH', '/hampter/api-settings', {
             source: 'proxy',
-            [selected.key || SELECTED_PRESET_KEYS[0]]: proxyId,
+            [pristine.selectedKey || SELECTED_PRESET_KEYS[0]]: proxyId,
             // A bounded context makes the server rewrite the prompt, losing the section
             // boundaries the definition is read from.
             generation_settings: { context_length: 0 },
@@ -3284,10 +3350,122 @@ async function extractHiddenDefinition(page, token, detail) {
         // whole: a plausible-looking config assembled here is a 500, not a set of defaults. This
         // is also self-correcting, since it carries whatever fields janitorai adds later.
         const live = await jaFetch('GET', '/hampter/api-settings', null, token, page);
-        const liveConfig = live.data?.legacy_config || live.data?.settings || null;
-        if (!liveConfig || typeof liveConfig !== 'object') {
+        win.liveConfig = live.data?.legacy_config || live.data?.settings || null;
+        if (!win.liveConfig || typeof win.liveConfig !== 'object') {
             throw new Error(`Could not read back the temporary settings (HTTP ${live.status})`);
         }
+    } catch (e) {
+        // The account is already mutated by this point, so a failure here has to undo it rather
+        // than leave the settings for an idle timer that will never be armed. Closed directly
+        // rather than through the live window: publishing a window that is being torn down would
+        // let a concurrent caller borrow it.
+        await closeExtractionWindow(win);
+        throw e;
+    }
+    return win;
+}
+
+/** Undo one window's account mutation. Best effort throughout: a failed proxy delete must not
+ *  leave the settings behind too. */
+async function closeExtractionWindow(w) {
+    if (!w) return;
+    const { token, page, proxyId, pristine } = w;
+    // DELETE must carry no Content-Type: an empty body with a json content-type 400s. jaFetch
+    // only sets it when there is a body, so passing null is what keeps that true.
+    if (proxyId) await jaFetch('DELETE', `/hampter/api-settings/proxy-configs/${proxyId}`, null, token, page).catch(() => {});
+    const restored = await jaFetch('PATCH', '/hampter/api-settings', {
+        source: pristine.source,
+        // Null is meaningful here (nothing was selected), so send it whenever the key was found.
+        ...(pristine.selectedKey ? { [pristine.selectedKey]: pristine.selectedValue } : {}),
+        // Replayed wholesale; rebuilding it would swap tuning values we dont model for defaults.
+        ...(pristine.generation ? { generation_settings: pristine.generation } : {}),
+    }, token, page).catch(() => null);
+    // Only drop the saved copy once the account actually has it back; otherwise the next run has
+    // nothing to heal from.
+    if (restored && restored.status < 400) {
+        try { await unlink(JA_RESTORE_FILE); } catch {}
+    } else {
+        console.warn('[cl-helper] janitorai settings restore failed; the saved copy is kept for the next run.');
+    }
+}
+
+/** Close the window currently in use, if there is one. Tracked in _jaWindowClosing because the
+ *  restore it sends would otherwise land after a window opened while it was still in flight,
+ *  quietly putting the account back to a bounded context for the extraction now using it. */
+function closeLiveWindow() {
+    const w = _jaWindow;
+    _jaWindow = null;
+    if (_jaWindowIdle) { clearTimeout(_jaWindowIdle); _jaWindowIdle = null; }
+    if (!w) return Promise.resolve();
+    _jaWindowClosing = closeExtractionWindow(w).finally(() => { _jaWindowClosing = null; });
+    return _jaWindowClosing;
+}
+
+/**
+ * Acquires run one at a time on _jaWindowGate. Serialising them is what lets the body below be read
+ * as straight-line code: without it every await is a point where another caller can arrive and find
+ * the window half-opened, closing, or belonging to somebody else.
+ */
+function acquireExtractionWindow(token, page) {
+    const acquired = _jaWindowGate.then(async () => {
+        if (_jaWindowIdle) { clearTimeout(_jaWindowIdle); _jaWindowIdle = null; }
+        // A window holds one account's settings and is restored with the token that opened it, so a
+        // caller signed in as somebody else must not borrow it: the mutation would land on their
+        // account and the restore would never be sent there. Closed and reopened rather than kept
+        // side by side, because the idle timer and the restore file are both single-valued and
+        // per-account windows would need them keyed too.
+        if (_jaWindow && _jaWindow.token !== token) await closeLiveWindow().catch(() => {});
+        // Opening on top of a close still in flight would race its restore; wait it out instead.
+        if (_jaWindowClosing) await _jaWindowClosing.catch(() => {});
+        if (!_jaWindow) _jaWindow = await openExtractionWindow(token, page);
+        _jaWindow.refs++;
+        return _jaWindow;
+    });
+    // The chain has to survive a failed acquire, or one error wedges every later one.
+    _jaWindowGate = acquired.then(() => {}, () => {});
+    return acquired;
+}
+
+async function releaseExtractionWindow() {
+    const w = _jaWindow;
+    if (!w || --w.refs > 0) return;
+    // Without the direct transport every call has to go through the caller's page, and that page
+    // stops existing when the request that owns it returns -- so there is nothing to hold the
+    // window open for, and closing now is the only moment a restore can still be sent.
+    if (!await getImpit()) return closeLiveWindow();
+    w.page = null;
+    // Deliberately not unref()d: an idle window means the account is still in proxy mode, and
+    // letting the process exit before the timer fires is exactly the state worth waiting for.
+    _jaWindowIdle = setTimeout(() => { closeLiveWindow().catch(() => {}); }, JA_WINDOW_IDLE_MS);
+}
+
+/**
+ * The generateAlpha capture. The account-level mutation lives in the shared window above; only the
+ * per-character resources are created and torn down here. The persona is named with a random
+ * sentinel rather than the macro itself: janitorai substitutes the persona name into the prompt,
+ * so a sentinel round-trips back to the macro exactly.
+ */
+// `page` is a provider, not a page: nothing here needs a browser unless the direct transport is
+// refused, and resolving it eagerly would reintroduce the launch this path exists to avoid.
+async function extractHiddenDefinition(page, token, detail) {
+    // Timings are logged because this path exists to be fast; a regression here is silent
+    // otherwise (it still returns the right definition, just slowly).
+    const _t0 = Date.now();
+    const _marks = [];
+    const _mark = (label) => _marks.push(`${label} ${Date.now() - _t0}ms`);
+    const { liveConfig, id: windowId } = await acquireExtractionWindow(token, page);
+    _mark(`window#${windowId}`);
+
+    // No fixed affix, so a persona left behind by a failed run reads as noise rather than a marker.
+    const userSentinel = randomHex(12).toUpperCase();
+    let personaId = null;
+    let chatId = null;
+    try {
+        const persona = await jaFetch('POST', '/hampter/personas', {
+            appearance: '', avatar: '', groupId: null, name: userSentinel, pronouns: null,
+        }, token, page);
+        personaId = persona.data?.id || null;
+        _mark('persona');
 
         const chat = await jaFetch('POST', '/hampter/chats',
             personaId ? { character_id: detail.id, persona_id: personaId } : { character_id: detail.id }, token, page);
@@ -3371,19 +3549,10 @@ async function extractHiddenDefinition(page, token, detail) {
         // capture, not a result. Leaving it behind puts one dead entry in the account's chat list
         // per extraction. Removed before the persona it references.
         // Best effort, and deliberately not aborting each other: a failed persona delete must not
-        // leave the proxy config and the account's settings behind too.
+        // leave the chat behind too.
         if (chatId) await jaFetch('DELETE', `/hampter/chats/${chatId}`, null, token, page).catch(() => {});
         if (personaId) await jaFetch('DELETE', `/hampter/personas/${personaId}`, null, token, page).catch(() => {});
-        // DELETE must carry no Content-Type: an empty body with a json content-type 400s. jaFetch
-        // only sets it when there is a body, so passing null is what keeps that true.
-        if (proxyId) await jaFetch('DELETE', `/hampter/api-settings/proxy-configs/${proxyId}`, null, token, page).catch(() => {});
-        await jaFetch('PATCH', '/hampter/api-settings', {
-            source: prevSource,
-            // Null is meaningful here (nothing was selected), so send it whenever the key was found.
-            ...(selected.key ? { [selected.key]: selected.value } : {}),
-            // Replayed wholesale; rebuilding it would swap tuning values we dont model for defaults.
-            ...(prevGeneration ? { generation_settings: prevGeneration } : {}),
-        }, token, page).catch(() => {});
+        await releaseExtractionWindow();
     }
 }
 
