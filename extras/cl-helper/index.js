@@ -2268,7 +2268,7 @@ const CAMOUFOX_OS = { win32: 'windows', darwin: 'macos', linux: 'linux' }[proces
  * if camoufox-js is missing or rejects this platform. Never throws: a degraded fingerprint still
  * browses, and failing the launch outright would take the provider down with it.
  */
-async function camoufoxLaunchOptions(exe) {
+async function camoufoxLaunchOptions(exe, headless) {
     const fallback = {
         executablePath: exe,
         env: { CAMOU_CONFIG: JSON.stringify(camoufoxConfig()) },
@@ -2277,7 +2277,7 @@ async function camoufoxLaunchOptions(exe) {
         const { launchOptions } = await import('camoufox-js');
         // camoufox-js resolves the browser (and its version.json) from here.
         if (!process.env.CAMOUFOX_INSTALL_DIR) process.env.CAMOUFOX_INSTALL_DIR = dirname(exe);
-        const o = await launchOptions({ headless: true, os: CAMOUFOX_OS, humanize: true });
+        const o = await launchOptions({ headless, os: CAMOUFOX_OS, humanize: true });
         // Only the keys launchPersistentContext takes; `proxy: null` would be rejected outright.
         return {
             executablePath: o.executablePath || exe,
@@ -2333,10 +2333,13 @@ async function getCamoufoxContext(req, force = false) {
         }
         const profile = camoufoxProfileDir(req);
         try { mkdirSync(profile, { recursive: true }); } catch {}
-        const opts = await camoufoxLaunchOptions(exe);
+        // Headful is the only way to answer an interactive Turnstile. The profile persists, so
+        // one manual sign-in is enough and later runs can go back to headless.
+        const headless = process.env.CL_CAMOUFOX_HEADFUL !== '1';
+        const opts = await camoufoxLaunchOptions(exe, headless);
         const context = await firefox.launchPersistentContext(profile, {
             ...opts,
-            headless: true,
+            headless,
             viewport: { width: 1280, height: 900 },
             // Playwright REPLACES the environment rather than extending it, so the browser would
             // lose PATH and friends if the fingerprint vars were passed on their own.
