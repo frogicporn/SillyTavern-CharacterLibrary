@@ -2390,7 +2390,10 @@ class CamoufoxPage {
     }
 
     async goto(url, { timeout = CDP_NAV_TIMEOUT } = {}) {
-        await this.page.goto(url, { timeout, waitUntil: 'load' });
+        // 'domcontentloaded', not 'load': janitorai's app holds connections open, so a signed-in
+        // session redirecting away from /login never fires load in Firefox and the navigation
+        // times out on a page that is already usable. Every caller sleeps or polls afterwards.
+        await this.page.goto(url, { timeout, waitUntil: 'domcontentloaded' });
     }
 
     async evaluate(expression, { timeout = CDP_COMMAND_TIMEOUT } = {}) {
