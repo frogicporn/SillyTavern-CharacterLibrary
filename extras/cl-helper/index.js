@@ -2317,7 +2317,16 @@ function armCamoufoxReaper() {
  */
 async function getCamoufoxContext(req, force = false) {
     if (force) await stopCamoufox();
-    if (_camoufox) { _camoufox.lastUsed = Date.now(); return _camoufox.context; }
+    // Reuse only a context that is actually up. It can die outside stopCamoufox -- a crash, an
+    // OOM, or the user closing the headful window after solving the captcha -- and the old code
+    // returned that dead reference on every later call, so the browser never came back until a
+    // full SillyTavern restart. isConnected() is the synchronous guard; the 'close' listener
+    // below is the belt-and-suspenders that clears the slot the moment the context dies.
+    if (_camoufox && _camoufox.context.browser()?.isConnected()) {
+        _camoufox.lastUsed = Date.now();
+        return _camoufox.context;
+    }
+    if (_camoufox) await stopCamoufox();
     if (_camoufoxPending) return _camoufoxPending;
 
     _camoufoxPending = (async () => {
@@ -2352,6 +2361,10 @@ async function getCamoufoxContext(req, force = false) {
         process.once('SIGTERM', killer);
         process.once('SIGINT', killer);
         _camoufox = { context, profile, lastUsed: Date.now() };
+        // Clear the reference the instant the context dies for any reason, so the next call
+        // relaunches instead of tripping over a dead handle. Guarded so a stale close from an
+        // already-replaced context cannot null a newer one.
+        context.once('close', () => { if (_camoufox?.context === context) _camoufox = null; });
         armCamoufoxReaper();
         console.log(`[cl-helper] camoufox up (${exe})`);
         return context;
@@ -2718,6 +2731,9 @@ function armWarmReaper() {
 async function getWarmPage(endpoint, req) {
     if (_warmPage && _warmPage.endpoint === endpoint && !_warmPage.client._closed) {
         _warmPage.lastUsed = Date.now();
+        // Reusing the warm page never re-enters getCamoufoxContext, so without this the shared
+        // context's idle clock freezes at creation and its reaper closes the browser mid-browse.
+        if (isCamoufoxEndpoint(endpoint) && _camoufox) _camoufox.lastUsed = Date.now();
         return _warmPage;
     }
     // Concurrent grid requests must share one warm-up, not race a dozen navigations. Joining is
