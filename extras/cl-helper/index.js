@@ -2240,6 +2240,9 @@ async function getImpit() {
  * @param {Object|null} page - fallback page; when null a refusal is surfaced as-is
  */
 async function jaFetch(method, path, body, token, page, { accept } = {}) {
+    // `page` may be a provider so the caller can avoid starting a browser it never needs; it is
+    // only invoked on the fallback path.
+    const getPage = () => (typeof page === 'function' ? page() : page);
     const impit = await getImpit();
     if (impit) {
         try {
@@ -2262,14 +2265,15 @@ async function jaFetch(method, path, body, token, page, { accept } = {}) {
                 try { d = JSON.parse(t); } catch { /* non-JSON body */ }
                 return { status: resp.status, data: d, text: d ? null : t };
             }
-            if (page) console.warn('[cl-helper] janitorai edge refused the direct transport; using the browser.');
+            console.warn('[cl-helper] janitorai edge refused the direct transport; using the browser.');
         } catch (e) {
             if (!page) throw e;
             console.warn(`[cl-helper] direct transport failed (${e.message}); using the browser.`);
         }
     }
     if (!page) throw new Error('janitorai refused the direct request and no browser was available.');
-    return page.evaluate(janitoraiCall(method, path, body, token));
+    const p = await getPage();
+    return p.evaluate(janitoraiCall(method, path, body, token));
 }
 
 function janitoraiCall(method, path, body, token) {
@@ -3109,41 +3113,56 @@ function registerJanitoraiBrowserRoutes(router) {
             }
         }
 
-        try {
+        // Every call here rides the direct transport, so a browser is dead weight unless the
+        // token has to be read out of one, or the edge refuses impit. Starting one regardless
+        // cost a launch, a navigation and a 3.5s settle on every extraction.
+        let held = null;
+        const getPage = async () => {
+            if (held) return held.page;
             const endpoint = await resolveBrowserEndpoint(req);
-            const result = await withJanitoraiPage(endpoint, async (page) => {
-                await page.goto(`${JANITORAI_ORIGIN}/`, { timeout: CDP_NAV_TIMEOUT });
-                await new Promise(r => setTimeout(r, 3500));
+            const client = await CdpClient.connect(endpoint);
+            const page = await CdpPage.create(client);
+            held = { client, page };
+            await page.goto(`${JANITORAI_ORIGIN}/`, { timeout: CDP_NAV_TIMEOUT });
+            await new Promise(r => setTimeout(r, 3500));
+            // Only matters for in-page fetches, which send the session as a cookie as well as a
+            // bearer; harmless when the browser is already signed in.
+            if (clientToken) await injectJanitoraiSession(page, clientToken, refreshToken);
+            return page;
+        };
 
-                // The account session and the browser are separate things. Character Library
-                // keeps a self-refreshing token of its own, so prefer that and treat a session
-                // inside the browser as a fallback: requiring the browser to be independently
-                // signed in would refuse perfectly good credentials the user already gave us.
-                const browserToken = readJanitoraiToken(await page.cookies([JANITORAI_ORIGIN])).token;
-                const token = clientToken || browserToken;
+        try {
+            // Character Library keeps a self-refreshing token of its own. A session inside the
+            // browser is the fallback, and reading it is the one thing that forces a launch.
+            let token = clientToken;
+            if (!token) {
+                const page = await getPage();
+                token = readJanitoraiToken(await page.cookies([JANITORAI_ORIGIN])).token;
+            }
 
-                // The chat UI renders no composer for a signed-out browser, so the session has
-                // to exist as a cookie too, not just as a Bearer on our fetches.
-                if (clientToken && !browserToken) {
-                    await injectJanitoraiSession(page, clientToken, refreshToken);
-                }
+            const detailRes = await jaFetch('GET', `/hampter/characters/${characterId}`, null, token, getPage);
+            if (detailRes.status === 404) throw new Error('That character no longer exists on JanitorAI.');
+            if (detailRes.status >= 400 || !detailRes.data) {
+                throw new Error(`JanitorAI returned HTTP ${detailRes.status} for that character.`);
+            }
+            const detail = detailRes.data;
 
-                const detailRes = await jaFetch('GET', `/hampter/characters/${characterId}`, null, token, page);
-                if (detailRes.status === 404) throw new Error('That character no longer exists on JanitorAI.');
-                if (detailRes.status >= 400 || !detailRes.data) {
-                    throw new Error(`JanitorAI returned HTTP ${detailRes.status} for that character.`);
-                }
-                const detail = detailRes.data;
-
-                if (detail.personality) return { detail, definition: '', extracted: false };
+            let result;
+            if (detail.personality) {
+                result = { detail, definition: '', extracted: false };
+            } else {
                 if (!token) throw new Error('This definition is hidden, so it needs a JanitorAI account. Sign in under Settings > Online > JanitorAI.');
-
-                return await extractHiddenDefinition(page, token, detail);
-            });
+                result = await extractHiddenDefinition(getPage, token, detail);
+            }
             res.json({ ok: true, ...result });
         } catch (err) {
             console.warn('[cl-helper] JanitorAI extract failed:', err.message);
             res.status(502).json({ ok: false, error: err.message });
+        } finally {
+            if (held) {
+                try { await held.page.close(); } catch {}
+                try { held.client.close(); } catch {}
+            }
         }
     });
 }
@@ -3202,6 +3221,8 @@ function promptErrorSnippet(body) {
  * is named with a random sentinel rather than the macro itself: janitorai substitutes the
  * persona name into the prompt, so a sentinel round-trips back to the macro exactly.
  */
+// `page` is a provider, not a page: nothing here needs a browser unless the direct transport is
+// refused, and resolving it eagerly would reintroduce the launch this path exists to avoid.
 async function extractHiddenDefinition(page, token, detail) {
     // Timings are logged because this path exists to be fast; a regression here is silent
     // otherwise (it still returns the right definition, just slowly).
